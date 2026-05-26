@@ -1,0 +1,7 @@
+Dataset,outcome,max_Rhat,min_ESS_bulk,min_ESS_tail,divergent_transitions,max_treedepth_hits,suggested_action
+I_scapularis,Scratch_bouts,1.001596021074004,5261.279206451328,6515.932130693318,0,0,No major MCMC warning from these checks.
+I_scapularis,Ticks_remaining,1.0009683974957977,5162.441322173192,5377.606815994069,0,0,No major MCMC warning from these checks.
+A_americanum,Scratch_bouts,1.0018062312469318,1622.706318899385,1851.0611504744156,0,0,No major MCMC warning from these checks.
+A_americanum,Ticks_remaining,1.0027961702999424,2482.0009304500963,3152.730548683678,0,0,No major MCMC warning from these checks.
+R_sanguineus,Scratch_bouts,1.0010369810984572,3209.9381389642685,5538.572030697707,0,0,No major MCMC warning from these checks.
+R_sanguineus,Ticks_remaining,1.0013939924302415,2237.8668657242524,2936.5926700477503,0,0,No major MCMC warning from these checks.

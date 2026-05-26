@@ -1,0 +1,1387 @@
+---
+title: "Analysis - WBC counts"
+author: "Johannes S. P. Doehl"
+date: "2024-04-24"
+output: pdf_document
+bibliography: Bibliography-BIB.bib
+---
+
+
+```{r setup, echo = FALSE, include = FALSE, eval = TRUE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      include = FALSE, 
+                      eval = TRUE, 
+                      cache = TRUE, 
+                      cache.lazy = FALSE, 
+                      dev = "png", 
+                      warning = FALSE, 
+                      message = FALSE, 
+                      fig.pos = "H", 
+                      out.extra = "")
+options(java.parameters = "-Xmx200000m")
+Sys.setenv(JAVA_HOME='C:\\Program Files\\Java\\jre-1.8') # Needed to get around loading error of rJava
+
+# Clear environment before starting to render document to ensure current data is used
+rm(list=ls())
+```
+
+```{r load-libraries, echo = FALSE, include = FALSE, eval = FALSE}
+# Load essential libraries
+library(easypackages) # allows loading and installation of multiple packages in one go
+
+libraries("ARTool",
+          "bookdown",
+          "car",
+          "conflicted",
+          "DescTools",
+          "dplyr",
+          "effectsize",
+          "emmeans",
+          "forcats",
+          "ggpubr",
+          "glmmTMB",
+          "grateful",
+          "here",
+          "gt",
+          "Hmisc",
+          "janitor",
+          "knitr",
+          "LambertW",
+          "lme4",
+          "magrittr",
+          "MANOVA.RM",
+          "MASS",
+          "metan",
+          "moments",
+          "multcomp",
+          "nlme",
+          "openxlsx",
+          "PMCMRplus",
+          "purrr",
+          "pwrss",
+          "rcompanion",
+          "readxl",
+          "rmarkdown",
+          "rstatix",
+          "RVAideMemoire",
+          "sjmisc",
+          "stats",
+          "stringr",
+          "survival",
+          "survminer",
+          "tibble",
+          "tidyverse",
+          "tools",
+          "utils",
+          "webshot2",
+          "WRS2"
+          )
+```
+
+```{r define-functions, include = FALSE}
+# Define functions
+
+## Reads in Data from all sheets at once + manipulation to extract only relevant data
+read_all <- function(filename, tibble = TRUE) {
+    # If tibble is preferred over data.frame use "tibble = TRUE"
+    sheets <- readxl::excel_sheets(filename)
+    x <- lapply(sheets, function(y) readxl::read_excel(filename, sheet = y))
+    x <- lapply(x, function(y) as.data.frame(y))
+    x <- lapply(x, function(y) y %>% mutate(., across(where(is.character), as.factor)))
+    names(x) <- sheets
+    x
+}
+
+#-------------------------------------------------------------------------------
+
+# Function for data transformation
+DatTrans <- function(x, depVar, indVar, Drop_Col = NULL, Remove_From = NULL, Term = NULL, Type = NULL) {
+    
+    # prompts selection of number corresponding to transformation
+    aa <- readline("Choose transformation:
+    0 = None
+    Mod skew (sqrt):
+    1 = + ; 2 = -
+    Hi skew (nl):
+    3 = + ; 4 = -
+    Hir skew (log10):
+    5 = + ; 6 = -
+    Ext skew (Inverse):
+    7 = + ; 8 = -
+    Other:
+    9 = Box-Cox") 
+    
+    # In case of negative values in the raw data; the data is translated, thus the smallest values becomes 1
+    if (any(x[c(depVar)] < 0)) { 
+        
+      print("Translated to min = 1")
+      
+      x <- x %>% 
+        mutate(across(all_of(depVar), ~ (.x + 1 - min(.x))))
+        
+    } else {
+      
+      print("Raw Data")
+      
+      x <- x
+      
+    }
+    
+    
+    # Executes the selected transformation
+    if (as.numeric(aa) == 1) {
+      
+      z <- "Square Root Transformed (+)"
+      print(z)
+      
+      y <- x %>%
+        mutate(across(any_of(depVar), ~ sqrt(.x + 1)))
+      
+      
+    } else if (as.numeric(aa) == 2) {
+      
+      z <- "Square Root Transformed (-)"
+      print(z)
+      
+      y <- x %>%
+        mutate(across(any_of(depVar), ~ sqrt(max(.x + 1) - .x)))
+      
+    } else if (as.numeric(aa) == 3) {
+      
+      z <- "Natural Log Transformed (+)"
+      print(z)
+      
+      y <- x %>% 
+        mutate(across(any_of(depVar), ~ log(.x + 1)))
+        
+      
+    } else if (as.numeric(aa) == 4) {
+      
+      z <- "Natural Log Transformed (-)"
+      print(z)
+      
+      y <- x %>% 
+        mutate(across(any_of(depVar), ~ log(max(.x + 1) - .x)))
+        
+      
+    } else if (as.numeric(aa) == 5) {
+      
+      z <- "Log10 Transformed (+)"
+      print(z)
+      
+      y <- x %>% 
+        mutate(across(any_of(depVar), ~ log10(.x + 1)))
+        
+      
+    } else if (as.numeric(aa) == 6) {
+      
+      z <- "Log10 Transformed (-)"
+      print(z)
+      
+      y <- x %>% 
+        mutate(across(any_of(depVar), ~ log10(max(.x + 1) - .x)))
+        
+      
+    } else if (as.numeric(aa) == 7) {
+      
+      z <- "Inverse Transformed (+)"
+      print(z)
+      
+      y <- x %>% 
+        mutate(across(any_of(depVar), ~ (1 / (.x + 1))))
+        
+      
+    } else if (as.numeric(aa) == 8) {
+      
+      z <- "Inverse Transformed (-)"
+      print(z)
+      
+      y <- x %>% 
+        mutate(across(any_of(depVar), ~ (1 / (max(.x + 1) - .x))))
+        
+      
+    } else if (as.numeric(aa) == 9) {
+      
+      z <- "Box-Cox power Transformed"
+      print(z)
+      
+      if (is.null(Drop_Col)) { # In case some rows need to be removed
+        
+        y <- x %>%
+        mutate(across(any_of(depVar), ~ (.x + 1)))
+        
+      } else if (Drop_Col == "Yes") {
+        
+        y <- x %>% # Splitting "Measure" variable back into two columns according to "Measure_Type"
+        .[!.[,Remove_From] %in% Term,] %>%
+        mutate(across(any_of(depVar), ~ (.x + 1)))
+        
+      } else {
+        
+        print("error")
+        
+        stop("Please, define `Drop_Col` with NULL or `Yes`")
+      }
+      
+      indVar <- indVar[indVar %in% names(y)] # In case, column names do not exist, these are dropped
+      
+      Mod <- lm(formula = as.formula(paste0("cbind(", paste(depVar, collapse = ", "), ") ~ ", paste(indVar, collapse = " * "))), data = y) # Run the linear model
+      
+      bc <- powerTransform(Mod)$lambda %>%
+        setNames(depVar) # Do the Box-Cox power Transformation
+    
+      y <- x %>%
+        mutate(across(any_of(depVar), ~ (.x + 1))) %>% # Modify outcome variables with respective lambda term
+        mutate(across(any_of(depVar), ~ bcPower(.x, bc[cur_column()])))  
+      
+      
+      } else if (as.numeric(aa) == 0) {
+      
+      z <- "untransformed"
+      print(z)
+      
+      y <- x
+      
+      } else {
+      
+        print("Wrong input")
+        stop()
+      }
+    
+    output <- list("Data" = y, "Transformation" = z)
+    
+    output
+}
+
+#-------------------------------------------------------------------------------
+
+# Adjusts for Skewness and Kurtosis, if needed
+ModSkeKur <- function(x, depVar, indVar, Type = "h") {
+  
+  # prompts selection of number corresponding to transformation
+    aa <- readline("Choose transformation:
+                   0 = None
+                   1 = MLE_LambertW")
+      
+  x <- x %>% 
+        mutate(., x %>%
+                 dplyr::select(any_of(indVar)) %>%
+                 as.data.frame(.) %>%
+                 mutate(., across(where(is.factor), as.character)) %>% 
+                 unite(., "IDs", sep = "_", remove = TRUE) %>% 
+                 mutate(., across("IDs", as.factor)))
+  
+  if (as.numeric(aa) == 1) {
+    
+    w <- "Lambert W transformed"
+    print(w)
+    
+    # Correct for kurtosis by Lambert W      
+    z <- sapply(depVar, function(a) {
+      
+      sapply(levels(x$IDs), function(y) {
+    
+        mod.Lh <- get_input(
+          MLE_LambertW(x[x$IDs %in% y, a], 
+                               distname = "normal", 
+                               type = Type)
+          ) %>%
+          enframe(.) %>%
+          .[,2] 
+        
+      }, simplify = FALSE) %>%
+        bind_rows(.) %>%
+        as.data.frame(.)
+      
+    }, simplify = FALSE) %>%
+      bind_cols(.) %>%
+      as.data.frame(.) %>%
+      set_colnames(depVar)
+    
+    # Replace with adjusted data
+    y <- x %>% 
+      arrange(IDs) %>%
+      sjmisc::replace_columns(., z) %>%
+      .[, !names(.) %in% "IDs"]
+    
+  } else if (as.numeric(aa) == 0) {
+    
+    w <- "untransformed"
+    print(w)
+    
+    y <- x %>%
+      .[, !names(.) %in% "IDs"]
+    
+  } else {
+      
+    print("Wrong input for cc")
+    stop()
+  }
+  
+  output <- list("Data" = y, "Transformation" = w)
+    
+  output
+}
+```
+
+```{r adjustable-variable-information, include = FALSE}
+#
+## Raw data folder
+RawDat <- "Data"
+
+RawDatSub <- "WBC counts"
+
+ColNamBld <- c("Pre-Treatment", "Pre-Infestation", "Post-Infestation")
+
+BldTyp <- c("WBC", "LYMPH", "NEUT", "MONO", "EO", "BASO")
+```
+
+```{r two-way-Mixed-ANOVA-FTY720-blood-samples, include = FALSE}
+# LOADING DATA #################################################################
+
+## Get data directory
+survival_dir <- file.path(here::here(), RawDat, RawDatSub)
+## List all excel files in directory as full directory names
+survival_files <- list.files(survival_dir, pattern = "\\.xlsx$", full.names = TRUE)
+
+## Stop the script if no files are found
+stopifnot(length(survival_files) >= 1)
+
+## Load all data from all files contained within the directory
+DatBld <- purrr::map(survival_files, read_all) %>%
+  purrr::set_names(str_extract(survival_files, "(?<=counts/).*(?= Blood)"))
+
+## Get the metadata from "DatBld" for each tick species
+MetDatBld <- lapply(DatBld, function(zz) {
+  
+  zz[["Groups"]]
+})
+
+## Remove the "Groups" dataframe
+DatBld <- lapply(DatBld, function(zz) {
+  
+  zz[! names(zz) %in% "Groups"]
+})
+
+# Normalize data by respective RBC counts; normalized to 5 [10^6 / ul]
+DatBld <- lapply(DatBld, function(zz) {
+  lapply(zz, function(yy) {
+    replace(yy, colnames(yy) %in% ColNamBld, t(t(yy[, ColNamBld]) * unlist(5 / yy[yy$Type == "RBC", ColNamBld])))
+  })
+})
+
+# Split dataframes into respective treatment groups
+DatBld <- mapply(function(xx, yy) {
+  lapply(levels(xx$Group), function(zz) {
+  yy[as.character(xx[xx$Group == zz,]$Guinea_Pig %>% droplevels())] }) %>%
+  setNames(levels(xx$Group))
+}, xx = MetDatBld,
+   yy = DatBld,
+   SIMPLIFY = FALSE)
+
+# Merge data into one dataframe
+DatBld <- lapply(DatBld, function(xx) {
+  xx %>%
+    purrr::map(., ~ bind_rows(.x, .id = "Guinea_Pig")) %>%
+    bind_rows(., .id = "State") %>%
+    pivot_longer(cols = ColNamBld,
+                 names_to = "Treatment",
+                 values_to = "Counts") %>%
+    dplyr::filter(if_all("Type", ~ .x %in% BldTyp)) %>%
+    droplevels(.) %>%
+    as.data.frame(.) %>%
+    mutate(., across(where(is.character), as.factor)) %>%
+    split(., f = .$Type)
+})
+```
+
+```{r WBC-data-analysis-by-two-way-mixed-anova, include = FALSE, eval = TRUE}
+# Data analysis
+ResBld <- lapply(DatBld, function(aa) {
+  
+  lapply(list(aa[["LYMPH"]]), function(bb) {
+  
+  # Extract the data by experiment
+  BldCnt <- bb %>%
+              dplyr::select(any_of(c("Guinea_Pig", "State", "Treatment", "Counts"))) %>%
+              mutate(., across(where(is.integer), as.numeric)) %>%
+              droplevels(.) %>%
+              mutate(across(where(is.character), as.factor))
+  
+  BldCnt$Treatment <- forcats::fct_rev(BldCnt$Treatment)
+    
+    # Generate raw data backup
+    BldCnt2 <- BldCnt
+    
+  
+  # DATA VISUALIZATION by box plot
+  DatDis <- ggplot(BldCnt , 
+                   aes(x = State, y = Counts, fill = Treatment)) + 
+    geom_boxplot()
+
+  
+  # SUMMARY STATISTICS
+  SumStat <- BldCnt %>%
+    group_by(State, Treatment) %>%
+    get_summary_stats(Counts, type = "full")
+  
+  
+# ASSUMPTION TESTING ###########################################################
+
+  # 1. NORMALITY ---------------------------------------------------------------
+  
+  # Data normality check and transformation loop
+  for (aa in 1:100) {
+    
+    # 1.1 Normality of groups (pre-transformation decision)
+    NormUV <- BldCnt %>% 
+      group_by(State, Treatment) %>%
+      rstatix::shapiro_test(Counts) %>%
+      mutate("Outcome" = ifelse(.$p <= 0.05, "sig.", "ns"))
+      
+      print(NormUV)
+      
+    # Skewness and kurtosis check by group (pre-transformation decision)
+    SkeKur <- lapply(list(BldCnt), function(x) {
+      
+      Skew <- x %>%
+        group_by(State, Treatment) %>%
+        metan::skew(.)
+      
+        if (any(Skew$Counts > 1)) {
+  
+          SkewOut <- "Right skew"
+          
+        } else if (any(Skew$Counts < -1)) {
+  
+          SkewOut <- "Left skew"
+          
+        } else {
+  
+          SkewOut <- "No skew"
+        }
+      
+      Kurt <- x %>%
+        group_by(State, Treatment) %>%
+        metan::kurt(.)
+        
+        if (any(Kurt$Counts > 2)) {
+  
+          KurtOut <- "Leptokurtic"
+          
+        } else if (any(Kurt$Counts < -2)) {
+  
+          KurtOut <- "Platykurtic"
+          
+        } else {
+  
+          KurtOut <- "Mesokurtic"
+        }
+      
+      list("Skewness: Result" = SkewOut,
+           "Skewness: Data"   = Skew, 
+           "Kurtosis: Result" = KurtOut,
+           "Kurtosis: Data"   = Kurt)
+      
+    }) %>%
+      purrr::flatten(.)
+    
+      print(SkeKur)
+    
+    # Make decision about data transformation   
+    bb <- readline("Continue loop?
+                   0 = Leave loop
+                   1 = Standard Transformation
+                   2 = LambertW Transformation
+                   3 = Revert to raw data")
+    
+    # Data transformation loop
+    if (bb == 0) { # leave the loop
+      
+      break
+      
+    } else if (bb == 1) { # Transform the data
+      
+      # DATA TRANSFORMATION 
+      BldCnt <- DatTrans(BldCnt,
+                         # Name all dependent variables
+                         depVar = "Counts",
+                         # Name all independent variables (predictors)
+                         indVar = c("State", "Treatment"))
+      
+      # Separate transformation information into separate variable
+      ResTrans <- BldCnt[["Transformation"]]
+      
+        print(ResTrans)
+        
+      # Convert transformed data back into a dataframe
+      BldCnt <- BldCnt[!names(BldCnt) %in% "Transformation"] %>%
+        purrr::flatten(.) %>%
+        bind_cols(.) %>%
+        as.data.frame(.)
+      
+    } else if (bb == 2) {
+      
+      # Choose to apply Lambert W or not
+      BldCnt <- ModSkeKur(BldCnt,
+                          # Name all dependent variables
+                          depVar = "Counts",
+                          # Name all independent variables (predictors)
+                          indVar = c("State", "Treatment"), 
+                          Type = "h")
+      
+      # Separate transformation information into separate variable
+      ResTransSK <- BldCnt[["Transformation"]]
+    
+        print(ResTransSK)
+      
+      # Convert transformed data back into a dataframe
+      BldCnt <- BldCnt[!names(BldCnt) %in% "Transformation"] %>%
+        purrr::flatten(.) %>%
+        as.data.frame(.)
+      
+    } else if (bb == 3) {
+      
+      # Revert to raw data in case transformation did not work out
+      BldCnt <- BldCnt2
+    }
+  }
+  
+  # In case no transformation was executed  
+  if (exists("ResTrans") == FALSE & exists("ResTransSK") == FALSE) {
+    
+    ResTrans <- "untransformed"
+    print(ResTrans)
+    
+    ResTransSK <- "untransformed"
+    print(ResTransSK)
+    
+  } else if (exists("ResTrans") == FALSE) {
+    
+    ResTrans <- "untransformed"
+    print(ResTrans)
+    
+  } else if (exists("ResTransSK") == FALSE) {
+    
+    ResTransSK <- "untransformed"
+    print(ResTransSK)
+  }
+  
+    # Data visualization: QQ-plot
+    qqplotBld <- ggpubr::ggqqplot(BldCnt, "Counts", ggtheme = theme_bw()) +
+    facet_grid(Treatment ~ State, labeller = "label_both")
+      
+    
+  # 1.2 Multivariate normality
+  # Build the linear model
+  Mod  <- lm(Counts ~ Treatment * State,
+               data = BldCnt)
+    
+    # Compute Shapiro-Wilk test of normality
+    NormRes <- shapiro_test(residuals(Mod))
+
+    # Create a QQ plot of residuals
+    qqplotRes <- ggpubr::ggqqplot(residuals(Mod), ggtheme = theme_bw())
+    
+  
+    # 2. OUTLIERS---------------------------------------------------------------
+    # Calculation of outliers
+    OutLierUV <- BldCnt %>% # Untransformed data
+      group_by(., across(any_of(c("Treatment", "State")))) %>%
+      identify_outliers(Counts) %>%
+      .[, c(1:3, (ncol(.)-1):ncol(.))]
+    
+      # Box-plot for visual assessment of outliers
+      BoxPlotUV <- ggboxplot(BldCnt,
+                             x = "State", 
+                             y = "Counts",
+                             color = "Treatment",
+                             palette = "jco"
+                             )
+      
+    
+    # 3. HOMOGENEITY OF VARIANCES-----------------------------------------------
+    
+    # Testing for homogeneity of variance between the groups of the between-subjects factors for each level of the within-subjects factors
+    EquVar <- BldCnt %>% # If violated, transformation may resolve the issue, or a robust mixed ANOVA can be applied
+      group_by(Treatment) %>%
+      levene_test(Counts ~ State, data = .)
+    
+      # Residual vs Fitted plot to assess variance by group
+      plot.new()
+      plot(Mod, 1)
+      EquVarPlot <- recordPlot()
+    
+  
+      # 4. HOMOGENEITY OF COVARIANCES---------------------------------------------
+    
+    BoxM <- box_m(BldCnt[, "Counts", drop = FALSE], BldCnt$State) # Test homogeneity of covariance in the between-subject factor; the test is highly sensitive, thus, consider p<0.001 as significance threshold
+    
+    
+    # 5. SPHERICITY-------------------------------------------------------------
+    # Mauchly's test executed automatically within anova_test() function, if within-subjects factor has >2 levels. For two within-subjects factor levels, the sphericity assumption hold by default. Here, we only have two levels in the within-subjects factor: "Ticks_Placed"
+      
+    # Two-way Mixed ANOVA (standard) for Maulchy's test
+      Spher <- rstatix::anova_test( # This version is suitable if there are no ouliers
+          data = BldCnt, dv = Counts, wid = Guinea_Pig,
+          between = State, within = Treatment
+          ) # Greenhouse-Geisser sphericity correction automatically applied if Mauchly's test is significant (p<0.05)
+      
+      
+  # RESULTS OF ASSUMPTION TESTING-------------------------------------------------
+    if (any(NormUV$p <= 0.05)) {
+      ResNormUV <- "Univariate: Non-Guassian"
+      print(ResNormUV)
+    } else {
+      ResNormUV <- "Univariate: Guassian"
+      print(ResNormUV)
+    }
+    
+    if (NormRes$p.value <= 0.05) {
+      ResNormRes <- "Residuals: Non-Guassian"
+      print(ResNormRes)
+    } else {
+      ResNormRes <- "Residuals: Guassian"
+      print(ResNormRes)
+    }
+    if (dim(OutLierUV)[1] != 0) {
+      ResOutUV <- paste0(dim(OutLierUV)[1], " ", 
+                      paste(gsub( ".*\\.", "", names(OutLierUV %>% 
+                                                       dplyr::select(where(~any(.x == TRUE)))))[c(2,1)] %>% 
+                              .[!is.na(.)], collapse = " "),
+                      "(s) found")
+      print(ResOutUV)
+    } else {
+      ResOutUV <- "No outliers"
+      print(ResOutUV)
+    }
+    
+    if (any(EquVar$p <= 0.05)) {
+      ResEquVar <- "Heterogenous variance"
+      print(ResEquVar)
+    } else {
+      ResEquVar <- "Homogeneous variance"
+      print(ResEquVar)
+    }
+    
+    if (BoxM$p.value <= 0.001) {
+      ResEquCoV <- "Heterogenous covariance"
+      print(ResEquCoV)
+    } else {
+      ResEquCoV <- "Homogeneous covariance"
+      print(ResEquCoV)
+    }
+      
+    if (tail(Spher[["Mauchly's Test for Sphericity"]][["p"]][2], n = 1) <= 0.05) {
+      ResSpher <- "Sphericity violated"
+      print(ResSpher)
+    } else {
+      ResSpher <- "Sphericity holds"
+      print(ResSpher)
+    }
+      
+      
+  # HYPOTHESIS TESTING SELECTION #############################################
+  
+  for (xx in 1:100) {
+    
+    # Make decision about data transformation   
+    cc <- readline("Select statistical test to run based on assumption tests:
+                    0 = Exist loop
+                    1 = Standard two-way mixed ANOVA
+                    2 = Robust two-way mixed ANOVA
+                    3 = Aligned Rank Transform for Nonparametric Factorial ANOVA")
+    
+    if (cc == 0) { # Leave the loop
+      
+      break
+    
+    } else if (cc == 1) { # Standard two-way mixed ANOVA if assumptions are met
+      
+      # 1. Two-way Mixed ANOVA (standard)
+      res.aov <- rstatix::anova_test( # This version is suitable if there are no ouliers
+          data = BldCnt, dv = Counts, wid = Guinea_Pig,
+          between = State, within = Treatment
+          ) # Greenhouse-Geisser sphericity correction automatically applied if Mauchly's test is significant (p<0.05)
+      
+      ResAovT <- "Standard two-way Mixed ANOVA"
+      print(ResAovT)
+      
+      
+      # Post-Hoc analysis for significant interaction
+      if (tail(res.aov[["ANOVA"]][["p"]][3], n = 1) <= 0.05) { 
+      
+        # A 1.1 One-way ANOVA (effect of the between-subject factor)
+        res.aovBetween <- BldCnt %>%
+          group_by(Treatment) %>%
+          rstatix::anova_test( # This version is suitable if there are no outliers
+           data = ., dv = Counts, wid = Guinea_Pig,
+           between = State
+            ) %>%
+          get_anova_table() %>%
+          adjust_pvalue(method = "BH")
+        
+        ResAovTBetween <- "One-way ANOVA"
+        print(ResAovTBetween)
+        
+          # A 1.1.1 Pairwise comparison (for within-subject factor)
+          PairCompBetween <- BldCnt %>%
+            group_by(Treatment) %>%
+            pairwise_t_test(Counts ~ State, 
+                            paired = FALSE, 
+                            p.adjust.method = "BH")
+          
+          ResPCTBetween = "Pairwise t test"
+        
+        # A 1.2. One-way repeated measures ANOVA (effect of the within-subject factor)
+        res.aovWithin <- BldCnt %>%
+          group_by(State) %>%
+          rstatix::anova_test( # This version is suitable if there are no outliers
+           data = ., dv = Counts, wid = Guinea_Pig,
+           within = Treatment
+            ) %>%
+          get_anova_table() %>%
+          adjust_pvalue(method = "BH")
+        
+        ResAovTWithin <- "One-way Repeated Measures ANOVA"
+        print(ResAovTWithin)
+        
+          # A 1.2.1 Pairwise comparison (for within-subject factor)
+          PairCompWithin <- BldCnt %>%
+            group_by(State) %>%
+            pairwise_t_test(Counts ~ Treatment, 
+                            paired = TRUE, 
+                            p.adjust.method = "BH")
+          
+          ResPCTWithin = "Pairwise Paired t tests"
+        
+        
+      } else { # Post-Hoc analysis for non-significant interaction
+        
+        # B 1.1. One-way repeated measures ANOVA (effect of the between-subject factor)
+        res.aovBetween <- NA
+        
+          ResAovTBetween <- "No significant interaction"
+          print(ResAovTBetween)
+        
+          # B 1.1.1. Pairwise comparison (for between-subject factor)
+          PairCompBetween <- BldCnt %>%
+            pairwise_t_test(Counts ~ State, 
+                            paired = FALSE, 
+                            p.adjust.method = "BH")
+          
+          ResPCTBetween <- "Pairwise t test"
+        
+        # B 1.2. One-way repeated measures ANOVA (effect of the within-subject factor)
+        res.aovWithin <- NA
+          
+          ResAovTWithin <- "No significant interaction"
+          print(ResAovTWithin)
+        
+          # B 1.2.1. Pairwise comparison (for within-subject factor)
+          PairCompWithin <- BldCnt %>%
+            pairwise_t_test(Counts ~ Treatment, 
+                            paired = TRUE, 
+                            p.adjust.method = "BH")
+          
+          ResPCTWithin <- "Pairwise Paired t tests"
+      }
+    
+      
+  } else if (cc == 2) { # Robust analysis if assumptions are not met
+    
+    # Robust Two-way Mixed ANOVA
+    res.aov <- bwtrim(Counts ~ State * Treatment, 
+                      id = Guinea_Pig, 
+                      tr = 0.1,
+                      data = BldCnt)
+    
+      ResAovT <- "Robust two-way Mixed ANOVA"
+      print(ResAovT)
+    
+      # Assessing each variable and their interaction separately
+      SinEff1 <- sppba(Counts ~ State * Treatment, 
+                       id = Guinea_Pig,
+                       tr = 0.1,
+                       data = BldCnt) # between groups effect only (MOM estimator)
+      
+      SinEff2 <- sppbb(Counts ~ State * Treatment, 
+                       id = Guinea_Pig,
+                       tr = 0.1,
+                       data = BldCnt) # within groups effect only (MOM estimator)
+      
+      SinEff3 <- sppbi(Counts ~ State * Treatment, 
+                       id = Guinea_Pig,
+                       tr = 0.1,
+                       data = BldCnt) # interaction effect only (MOM estimator)
+      
+    
+    if (res.aov$AB.p.value <= 0.05) { # Post-Hoc analysis for significant interaction
+      
+      # Robust one-way repeated measures ANOVA (effect of the within-subject factor) 
+      res.aovWithin <- lapply(levels(BldCnt$State), function(x) { # Executes the one-way RM ANOVA for each group separately
+        with(subset(BldCnt, subset = State == x),
+          rmanova(y = Counts,
+                  groups = Treatment, 
+                  block = Guinea_Pig,
+                  tr = 0.1))
+        }) %>%
+        setNames(levels(BldCnt$State)) %>%
+        lapply(., function(y) {
+          bind_cols(y[!names(y) %in% "call"])
+        }) %>%
+        bind_rows(.) %>%
+        adjust_pvalue(method = "BH") %>%
+        add_column(State = levels(BldCnt$State),
+                   Effect = rep("Treatment", 
+                                times = length(levels(BldCnt$State))),
+                   .before = "test")
+      
+      ResAovTWithin <- "Robust one-way repeated ANOVA"
+      print(ResAovTWithin)
+      
+      
+      if (length(levels(BldCnt$Treatment)) > 2) { # Execute if within-subject factor has more than 2 levels; for 2 levels rmanova() is equivalent to pairwise comparison
+        
+        # Pairwise comparison (for within-subject factor)
+        PairCompWithin <- lapply(levels(BldCnt$State), function(x) { # Executes the pariwise test for each group separately
+          with(subset(BldCnt, subset = State == x),
+               rmmcp(y = Counts, 
+                     groups = Treatment, 
+                     block = Guinea_Pig,
+                     tr = 0.1))
+          }) %>%
+          setNames(levels(BldCnt$State)) %>%
+          lapply(., function(y) {
+            as.data.frame(y$comp) %>%
+              set_colnames(make.unique(colnames(.))) %>%
+          mutate(across(grep("Group", colnames(.)), ~ifelse(. == 1, "Pre-Treatment", 
+                                                            ifelse(. == 2, "Pre-Infestation", "Post-Infestation"))))
+          }) %>%
+          bind_rows(., .id = "Level")
+        
+        ResPCTWithin <- "Robust pairwise paired comparison"
+        print(ResPCTWithin)
+      
+        
+      } else {
+        
+        PairCompWithin <- NA
+        
+        ResPCTWithin <- "Robust pairwise paired comparison not executed"
+        print(ResPCTWithin)
+      }
+    
+      # Robust one-way ANOVA (effect of the between-subject factor)
+      res.aovBetween <- lapply(levels(BldCnt$Treatment), function(x) {
+        t1way(formula = Counts ~ State, 
+              data = subset(BldCnt, subset = Treatment == x), 
+              tr = 0.1) %>%
+          append(., split(.$effsize_ci, 
+                          f = c("effsize_ci_lower", "effsize_ci_upper")), 
+                 after = 5) %>%
+          .[!names(.) %in% c("effsize_ci", "alpha", "call")]
+        }) %>%
+        setNames(levels(BldCnt$Treatment)) %>%
+        lapply(., function(y) {
+          bind_cols(y[!names(y) %in% "call"])
+        }) %>%
+        bind_rows(., .id = "Treatment") %>%
+        adjust_pvalue(method = "BH") %>%
+        add_column(Effect = rep("State", 
+                                times = length(levels(BldCnt$Treatment))),
+                   .before = "test")
+      
+      
+      ResAovTBetween <- "Robust one-way ANOVA"
+      print(ResAovTBetween)
+      
+      
+      # Execute if within-subject factor has more than 2 levels
+      if (length(levels(BldCnt$State)) > 2) { 
+         
+        # Pairwise comparison (for between-subject factor)
+        PairCompBetween <- lapply(levels(BldCnt$Treatment), function(x) {
+          lincon(formula = Counts ~ State, 
+                 data = subset(BldCnt, subset = Treatment == x), 
+                 tr = 0.1, 
+                 method = "BH")
+          }) %>%
+          setNames(levels(BldCnt$Treatment)) %>%
+          lapply(., function(y) {
+            as.data.frame(y$comp) %>%
+              set_colnames(make.unique(colnames(.))) %>%
+              mutate(across(grep("Group", colnames(.)), 
+                            ~ifelse(. == 1, "FTY720", 
+                                    ifelse(. == 2, "Naive", "PBS")))) 
+          }) %>%
+          bind_rows(., .id = "Level") %>%
+          adjust_pvalue(method = "BH")
+         
+        ResPCTBetween <- "Robust pairwise comparison"
+        print(ResPCTBetween)
+        
+        
+        } else { # for 2 levels t1way() is equivalent to pairwise comparison
+          
+          PairCompBetween <- NA
+      
+          ResPCTBetween <- "Robust pairwise comparison not executed"
+          print(ResPCTBetween)
+        
+        }
+      
+      
+    } else { # Post-Hoc analysis for non-significant interaction
+      
+      # Robust one-way repeated measures ANOVA (effect of the within-subject factor)
+      res.aovWithin <- NA
+      
+      ResAovTWithin <- "No significant interaction"
+      print(ResAovTWithin)
+      
+      
+      # Execute if within-subject factor has more than 2 level
+      if (length(levels(BldCnt$Treatment)) > 2) { 
+        
+        # Pairwise comparison (for within-subject factor)
+        PairCompWithin <- with(BldCnt,
+               rmmcp(y = Counts, 
+                     groups = Treatment, 
+                     block = Guinea_Pig,
+                     tr = 0.1)) %>%
+          .$comp %>%
+          as.data.frame(.) %>%
+          set_colnames(make.unique(colnames(.))) %>%
+          mutate(across(grep("Group", colnames(.)), ~ifelse(. == 1, "Pre-Treatment",
+                                                            ifelse(. == 2, "Pre-Infestation", "Post-Infestation")))) %>%
+          adjust_pvalue(method = "BH")
+        
+        ResPCTWithin <- "Robust pairwise paired comparison (rmmcp)"
+        print(ResPCTWithin)
+        
+        
+      } else {
+        
+        # Pairwise comparison (for within-subject factor)
+        PairCompWithin <- with(BldCnt,
+          rmanova(y = Counts,
+                  groups = Treatment, 
+                  block = Guinea_Pig,
+                  tr = 0.1)) %>%
+          .[c(1:4)] %>%
+          bind_cols(.) %>%
+          as.data.frame %>%
+          set_rownames("Treatment")
+        
+        ResPCTWithin <- "Robust pairwise paired comparison (rmanova)"
+        print(ResPCTWithin)
+      }
+    
+      
+      # Robust one-way ANOVA (effect of the between-subject factor)
+      res.aovBetween <- NA
+      
+      ResAovTBetween <- "No significant interaction"
+      print(ResAovTBetween)
+      
+      
+      if (length(levels(BldCnt$State)) > 2) { # Execute if within-subject factor has more than 2 levels; for 2 levels rmanova() is equivalent to pairwise comparison
+         
+        # Pairwise comparison (for between-subject factor)
+        PairCompBetween <- lincon(formula = Counts ~ State, 
+                 data = BldCnt, 
+                 tr = 0.1, 
+                 method = "BH") %>%
+          .$comp %>%
+          as.data.frame(.) %>%
+          set_colnames(make.unique(colnames(.))) %>%
+          mutate(across(grep("Group", colnames(.)),
+                        ~ifelse(. == 1, "FTY720", 
+                                ifelse(. == 2, "Naive", "PBS")))) %>%
+          adjust_pvalue(method = "BH")
+         
+        ResPCTBetween <- "Robust pairwise comparison"
+        print(ResPCTBetween)
+        
+        
+        } else {
+          
+          # Robust one-way ANOVA (effect of the between-subject factor)
+          PairCompBetween <- t1way(formula = Counts ~ State,
+                                    data = BldCnt,
+                                    tr = 0.1) %>%
+              append(., split(.$effsize_ci, 
+                              f = c("effsize_ci_lower", "effsize_ci_upper")), 
+                     after = 5) %>%
+              .[!names(.) %in% c("effsize_ci", "alpha", "call")] %>%
+            bind_cols(.) %>%
+            as.data.frame(.) %>%
+            set_rownames("State")
+          
+      
+          ResPCTBetween <- "Robust pairwise paired comparison not executed"
+          print(ResPCTBetween)
+        }
+      }
+      
+      # Summarize robust two-way mixed ANOVA into a printable dataframe                
+      res.aov <- as.data.frame(rbind(c(unlist(res.aov[c(1,3,2)])),
+                                        c(unlist(res.aov[c(4,6,5)])),
+                                        c(unlist(res.aov[c(7,9,8)]))) %>%
+                                    set_rownames(c(res.aov$call$formula[[3]][[2]],
+                                                   res.aov$call$formula[[3]][[3]],
+                                                   paste(res.aov$call$formula[[3]][[2]],
+                                                         res.aov$call$formula[[3]][[3]],
+                                                         sep = ":"))) %>% 
+                                    set_colnames(c("value", "df1", "df2", "p.value"))) %>%
+        mutate(., "sig." = .[["p.value"]] %>%
+                 symnum(.,
+                        cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 0.1, 1),
+                        symbols = c("****", "***", "**", "*", "+", "ns"))) %>%
+        mutate(., across(where(is.numeric), ~ ifelse(.x < 0.0001, "<0.0001", round(.x, 4)))) %>%
+        tibble::rownames_to_column(., var = "Factor")
+        
+      
+  } else if (cc == 3) { # non-parametric alternative for two-way mixed ANOVA
+    
+    # Aligned Rank Transform for Nonparametric Factorial ANOVA
+    
+    # Check if transformation is valid (all output = 0)
+    tryCatch({summary(ARTool::art(Counts ~ Treatment * State + Error(Guinea_Pig), 
+                                  data = BldCnt)); EM <<- 0}, 
+             # If not all output = 0 a warning is thrown
+             warning = function(w) {EM <<- 1})
+             
+    # Select test
+    if (EM == 0) {
+      
+      # Aligned Rank Transform for Nonparametric Factorial ANOVA
+      res.aov <- anova(ARTool::art(Counts ~ Treatment * State + Error(Guinea_Pig),
+                                   data = BldCnt))
+      
+      ResAovT <- "Aligned Rank Transform for Nonparametric Factorial ANOVA"
+      print(ResAovT)
+      
+      # Post-Hoc analysis for significant interaction
+      if (tail(res.aov[, "Pr(>F)"], n = 1) <= 0.05) { 
+      
+        # A 1.1 Kruskal-Wallis test (effect of the between-subject factor)
+        res.aovBetween <- list(
+          "Kruskal-Wallis test" = BldCnt %>%
+            group_by(Treatment) %>%
+            rstatix::kruskal_test(Counts ~ State, 
+             data = .) %>%
+            adjust_pvalue(method = "BH"),
+          
+          "Kruskal-Wallis effect size" = BldCnt %>%
+            group_by(Treatment) %>%
+            rstatix::kruskal_effsize(Counts ~ State, 
+             data = .))
+        
+        ResAovTBetween <- "Kruskal-Wallis test"
+        print(ResAovTBetween)
+        
+          # A 1.1.1 Pairwise comparison by Dunn's test (for between-subject factor)
+          PairCompBetween <- BldCnt %>%
+            group_by(Treatment) %>%
+            dunn_test(Counts ~ State,
+                      p.adjust.method = "BH")
+          
+          ResPCTBetween = "Dunn's test"
+          print(ResPCTBetween)
+        
+        # A 1.2. Friedman test (effect of the within-subject factor)
+        res.aovWithin <- list(
+          "Friedman test" = BldCnt %>%
+            group_by(State) %>%
+            rstatix::friedman_test(Counts ~ Treatment | Guinea_Pig,
+                                   data = .) %>%
+            adjust_pvalue(method = "BH"),
+        
+          "Friedman effect size" = BldCnt %>%
+            group_by(State) %>%
+            rstatix::friedman_effsize(Counts ~ Treatment | Guinea_Pig,
+                                 data = .))
+        
+        ResAovTWithin <- "Friedman test"
+        print(ResAovTWithin)
+        
+          # A 1.2.1 Pairwise comparison by exact all-pairs comparisons tests (for within-subject factor)
+          PairCompWithin <- lapply(levels(BldCnt$State), function (aa) {
+            
+            xxx <- BldCnt[BldCnt$State %in% aa,] %>%
+              dplyr::select(!State) %>%
+              pivot_wider(., names_from = Treatment, values_from = Counts) %>%
+              tibble::column_to_rownames("Guinea_Pig") %>%
+              as.matrix(.)
+              
+              # Post-hoc exact all-pairs comparisons test
+              PairComp <- PMCMRplus::frdAllPairsExactTest(y = as.matrix(xxx), p.adjust.method = "BH")
+              
+              PMCMRTable(PairComp) %>%
+                mutate(., across("p.value", as.numeric)) %>%
+                mutate(., "sig." = .[["p.value"]] %>%
+                         symnum(.,
+                                cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 0.1, 1),
+                                symbols = c("****", "***", "**", "*", "+", "ns"))) %>%
+                mutate(., across(where(is.numeric), ~ ifelse(.x < 0.0001, "<0.0001", round(.x, 4))))
+            
+            }) %>%
+            setNames(levels(BldCnt$State)) %>%
+            bind_rows(., .id = "State")
+            
+          ResPCTWithin = "Exact all-pairs comparisons tests"
+          print(ResPCTWithin)
+        
+        
+      } else { # Post-Hoc analysis for non-significant interaction
+        
+        # B 1.1. One-way repeated measures ANOVA (effect of the between-subject factor)
+        res.aovBetween <- NA
+        
+          ResAovTBetween <- "No significant interaction"
+          print(ResAovTBetween)
+        
+          # B 1.1.1. Pairwise comparison (for between-subject factor)
+          PairCompBetween <- BldCnt %>%
+            dunn_test(Counts ~ State,
+                      p.adjust.method = "BH")
+          
+          ResPCTBetween = "Dunn's test"
+          print(ResPCTBetween)
+        
+        # B 1.2. One-way repeated measures ANOVA (effect of the within-subject factor)
+        res.aovWithin <- NA
+          
+          ResAovTWithin <- "No significant interaction"
+          print(ResAovTWithin)
+        
+          # B 1.2.1. Pairwise comparison (for within-subject factor)
+          PairCompWithin <- lapply(list(BldCnt), function (aa) {
+            
+            xxx <- aa %>%
+              dplyr::select(!State) %>%
+              pivot_wider(., names_from = Treatment, values_from = Counts) %>%
+              tibble::column_to_rownames("Guinea_Pig") %>%
+              as.matrix(.)
+          
+              # Post-hoc exact all-pairs comparisons test
+              PairComp <- PMCMRplus::frdAllPairsExactTest(y = as.matrix(xxx), p.adjust.method = "BH")
+          
+              # Convert output to table format
+              PMCMRTable(PairComp) %>%
+                mutate(., across("p.value", as.numeric)) %>%
+                mutate(., "sig." = .[["p.value"]] %>%
+                         symnum(.,
+                                cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 0.1, 1),
+                                symbols = c("****", "***", "**", "*", "+", "ns"))) %>%
+                mutate(., across(where(is.numeric), ~ ifelse(.x < 0.0001, "<0.0001", round(.x, 4))))
+            
+            })
+            
+          ResPCTWithin = "Exact all-pairs comparisons tests"
+          print(ResPCTWithin)
+      }
+    
+    } else {
+      
+      print("ART transformation may not be applicable")
+      
+    }
+  }
+  }
+      
+  # COLLATE DATA----------------------------------------------------------------
+    
+  # Collate the test outcome calls
+  AssTest <- as.data.frame(rbind("Dat_Transformation"                         = ResTrans,
+                                 "Transformation for skewness and kurtosis"   = ResTransSK,
+                                 "Data_Normality_Assumption"                  = ResNormUV,
+                                 "Residual_Normality_Assumption"              = ResNormRes,
+                                 "Outliers"                                   = ResOutUV,
+                                 "Homogeneity_of_Variance"                    = ResEquVar,
+                                 "Homogeneity_of_Covariance"                  = ResEquCoV,
+                                 "Maulchy's test for sphericity"              = ResSpher,
+                                 "2-way_Mixed_ANOVA_Test_applied"             = ResAovT,
+                                 "1-way_Repeated_Measures_ANOVA_Test_applied" = ResAovTWithin,
+                                 "Pairwise_Post_Hoc_Test_applied_(Within)"    = ResPCTWithin,
+                                 "1-way_ANOVA_Test_applied"                   = ResAovTBetween,
+                                 "Pairwise_Post_Hoc_Test_applied_(Between)"   = ResPCTBetween
+                                 )) %>%
+    setNames(., "Outcome")
+  
+  # Compile output data list
+  AovDat <- list("Summary"                                  = SumStat,
+                 "Data Box plot"                            = DatDis,
+                 "Assumption_Test_Outcome"                  = AssTest,
+                 "Data_Normality_Assumption"                = NormUV,
+                 "QQ plot: by groups"                       = qqplotBld,
+                 "Skewness and Kurtsosis"                   = SkeKur,
+                 "Residual_Normality_Assumption"            = NormRes,
+                 "QQ plotof residuals"                      = qqplotRes,
+                 "Outliers"                                 = OutLierUV,
+                 "Box plot"                                 = BoxPlotUV,
+                 "Homogeneity_of_Variance"                  = EquVar,
+                 "Homogeneity_of_Covariance"                = BoxM,
+                 "Residuals_vs_Fitted"                      = EquVarPlot,
+                 "Maulchy's_test_of_sphericity"             = Spher,
+                 "2-way_Mixed_ANOVA"                        = res.aov,
+                 "1-way_Repeated_Measures_ANOVA_Type"       = res.aovWithin,
+                 "Pairwise_Post_Hoc_Test_applied_(Within)"  = PairCompWithin,
+                 "1-way_ANOVA_Type"                         = res.aovBetween,
+                 "Pairwise_Post_Hoc_Test_applied_(Between)" = PairCompBetween
+                 )
+  }) %>%
+    setNames("LYMPH")
+})
+
+# Delete variables that are no longer needed to free memory 
+rm(FilNamBld, MetDatBld)
+
+gc()
+```
+
+```{r save-essential-output, include = FALSE}
+# Save the pairwise Cox PH model and AHR data for all scratch bouts to the head
+
+  ## Create workbook to store data
+  wb <- openxlsx::createWorkbook() 
+  
+  ## Vector of sheet names
+  SheetNames <- paste(rep(names(ResBld), each = 5), c("2w-Mix-ANOVA", 
+                                                      "1w-RM-ANOVA",
+                                                      "Pairwise-within",
+                                                      "1w-ANOVA",
+                                                      "Pairwise-between"), sep = "_") 
+  
+  ## Collat the data we want to export
+  DatOut <- lapply(ResBld, function(xx) {
+    lapply(xx, function(yy) {
+    
+      list(yy[["2-way_Mixed_ANOVA"]],
+           yy[["1-way_Repeated_Measures_ANOVA_Type"]],
+           yy[["Pairwise_Post_Hoc_Test_applied_(Within)"]],
+           yy[["1-way_ANOVA_Type"]],
+           yy[["Pairwise_Post_Hoc_Test_applied_(Between)"]])
+    }) %>%
+      unlist(., recursive = FALSE) 
+  }) %>%
+    unlist(., recursive = FALSE) %>%
+    purrr::set_names(SheetNames)
+
+  ## Implementation of sheets into workbook
+  sapply(SheetNames, function(x) { addWorksheet(wb, sheetName = x) }, simplify = FALSE) 
+  
+  ## writing the data into the respective workbook sheet
+  mapply(function(x, y) { 
+    
+    writeData(wb, 
+              sheet = y, 
+              x = x, 
+              startRow = 1, 
+              startCol = 1, 
+              rowNames = TRUE) 
+    
+    }, x = DatOut,
+       y = SheetNames)
+
+  
+  
+  ## Saving the workbook
+  openxlsx::saveWorkbook(wb, 
+                         file = paste(here::here(),
+                                      "Output",
+                                      "LYMPH", 
+                                      "Lymphocyte Counts.xlsx", 
+                                      sep = "/"),
+                         overwrite = TRUE)
+  
+#-------------------------------------------------------------------------------
+
+# Tidy up  
+rm(wb, SheetNames)
+  
+gc()
+```
+
+```{r create-output-table, include = FALSE}
+## Collat the data we want to export
+DatOut <- lapply(ResBld, function(xx) {
+  lapply(xx, function(yy) {
+  
+    list(yy[["2-way_Mixed_ANOVA"]],
+         yy[["1-way_Repeated_Measures_ANOVA_Type"]],
+         yy[["Pairwise_Post_Hoc_Test_applied_(Within)"]],
+         yy[["1-way_ANOVA_Type"]],
+         yy[["Pairwise_Post_Hoc_Test_applied_(Between)"]])
+  }) %>%
+    unlist(., recursive = FALSE) %>%
+    purrr::set_names(c("Two way Mixed ANOVA", 
+                       "One-way Repeated Measures ANOVA",
+                       "Pairwise Comparison by within factor",
+                       "One-way ANOVA",
+                       "Pairwise Comparison by between factor"))
+}) %>%
+  # unlist(., recursive = FALSE) %>%
+  purrr::set_names(names(ResBld))
+
+# Produce tables of the pairwise Cox PH models
+mapply(function(aa, bb) {
+  
+  mapply(function(xx, yy) {
+    
+    if (!hasName(yy, "sig.")) { 
+      # Get the data adjusted
+      if (length(yy) != 1) {
+        Dat <- yy %>%
+          mutate("sig." = symnum(
+              if (ncol(pick(matches("adj\\.p"))) > 0) {
+                pick(matches("adj\\.p"))[[1]] # Select the first matched column
+              } else {
+                p.value # Fallback to the standard p.value column
+              },
+              cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 0.1, 1),
+              symbols = c("****", "***", "**", "*", "+", " "),
+              abbr.colnames = FALSE,
+              na = ""
+            )) %>%
+            mutate(., across(where(is.numeric), ~ round(.x, 4))) %>%
+            mutate(., across(contains("p.value"), ~ ifelse(.x < 0.0001, "<0.0001", .x)))
+          
+        } else {
+          
+          Dat <- as.data.frame("NA")
+        }
+    } else {
+      Dat <- yy %>%
+        mutate(., across(where(is.numeric), ~ round(.x, 4)))
+      
+    }
+    
+    if (ncol(Dat) > 1) {
+      
+      # Turn it into a table
+      gtsave(data =
+             Dat %>%
+               as.data.frame() %>%
+               # Build a table
+               gt() %>%
+               tab_header(
+                 title = xx,
+                 subtitle = bb
+                 ) %>%
+               tab_style(
+                 style = cell_text(align = "center"),
+                 locations = cells_column_labels()),
+             filename = paste0(bb, xx, ".png"),
+             path = paste(here(), "Output", "Tables", "LYMPH", bb, sep = "/"))
+    } else {
+      
+    }
+  }, xx = names(aa),
+     yy = aa)
+  
+}, aa = DatOut,
+   bb = names(DatOut))
+```

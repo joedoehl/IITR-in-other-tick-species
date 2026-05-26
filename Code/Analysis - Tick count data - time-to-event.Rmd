@@ -1,0 +1,1169 @@
+---
+title: "Analysis - Tick count data (Time-to-event)"
+author: "Johannes S. P. Doehl"
+date: "2026-05-15"
+output: pdf_document
+---
+
+~~~{=comment}
+# Setup
+~~~
+```{r setup, echo = FALSE, include = FALSE, eval = TRUE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      include = FALSE, 
+                      eval = TRUE, 
+                      cache = TRUE, 
+                      cache.lazy = FALSE, 
+                      dev = "png", 
+                      warning = FALSE, 
+                      message = FALSE, 
+                      fig.pos = "H", 
+                      out.extra = "")
+options(java.parameters = "-Xmx200000m")
+Sys.setenv(JAVA_HOME='C:\\Program Files\\Java\\jre-1.8') # Needed to get around loading error of rJava
+
+# Clear environment before starting to render document to ensure current data is used
+rm(list=ls())
+```
+
+```{r load-libraries, echo = FALSE, include = FALSE, eval = FALSE}
+# Load essential libraries
+library(easypackages) # allows loading and installation of multiple packages in one go
+
+libraries("ARTool",
+          "bookdown",
+          "car",
+          "conflicted",
+          "DescTools",
+          "dplyr",
+          "effectsize",
+          "emmeans",
+          "forcats",
+          "ggpubr",
+          "glmmTMB",
+          "grateful",
+          "here",
+          "gt",
+          "Hmisc",
+          "janitor",
+          "knitr",
+          "lme4",
+          "magrittr",
+          "MANOVA.RM",
+          "MASS",
+          "metan",
+          "moments",
+          "multcomp",
+          "nlme",
+          "openxlsx",
+          "PMCMRplus",
+          "purrr",
+          "pwrss",
+          "rcompanion",
+          "readxl",
+          "rmarkdown",
+          "rstatix",
+          "RVAideMemoire",
+          "sjmisc",
+          "stats",
+          "stringr",
+          "survival",
+          "survminer",
+          "tibble",
+          "tidyverse",
+          "tools",
+          "utils",
+          "webshot2"
+          )
+```
+
+```{r define-functions, include = FALSE}
+# Define functions
+
+## Reads in Data from all sheets at once + manipulation to extract only relevant data
+read_all <- function(filename, tibble = TRUE) {
+    # If tibble is preferred over data.frame use "tibble = TRUE"
+    sheets <- readxl::excel_sheets(filename)
+    x <- lapply(sheets, function(y) readxl::read_excel(filename, sheet = y))
+    x <- lapply(x, function(y) as.data.frame(y))
+    x <- lapply(x, function(y) y %>% mutate(., across(where(is.character), as.factor)))
+    names(x) <- sheets
+    x
+}
+
+## Define function to run survival analysis, pairwise comparison and produce asterisks
+fit_peto <- function(x, group_var) {
+  # Define the formula
+  f <- as.formula(sprintf("Surv(Hours_pi, Event) ~ %s", group_var))
+  # Pairwise comparison
+  pw <- survminer::pairwise_survdiff(
+    f, # Input the formula
+    data = x, # Input the data
+    p.adjust.method = "BH", # Adjust p-values for multiple comparision with FDR correction
+    rho = 1 # NOTE: rho = 1 calls the Peto-Peto modification of the Gehan-Wilcoxon test
+  )
+  # Put data together for output
+  list(
+    "Survival" = survival::survdiff(f, data = x, rho = 1),
+    "Pairwise" = pw,
+    "Asterisks" = symnum(
+      pw$p.value,
+      cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 0.1, 1),
+      symbols = c("****", "***", "**", "*", "+", " "),
+      abbr.colnames = FALSE,
+      na = ""
+    )
+  )
+}
+
+## function for the Cox proportional hazards model containing tt() as dummy variabls
+fit_cox_tt <- function(xx) {
+  
+  mm <- model.matrix(~ Infestation, data = xx)[, -1, drop = FALSE]
+  colnames(mm) <- make.names(colnames(mm))
+  
+  x2 <- dplyr::bind_cols(xx, as.data.frame(mm))
+  
+  dummy_names <- colnames(mm)
+  level_map <- tibble::tibble(
+    Infestation = levels(xx$Infestation)[-1],
+    dummy = dummy_names
+  )
+  
+  main_terms <- paste(dummy_names, collapse = " + ")
+  tt_terms   <- paste0("tt(", dummy_names, ")", collapse = " + ")
+  
+  form <- as.formula(
+    paste0(
+      "Surv(Hours_pi, Event) ~ ",
+      main_terms,
+      " + ",
+      tt_terms,
+      " + frailty(Guinea_Pig, distribution = 'gaussian', sparse = TRUE, method = 'reml')"
+    )
+  )
+  
+  tt_fun <- function(z, t, ...) {
+    z * log(pmax(t, 1))
+  }
+  
+  fit <- survival::coxph(
+    form,
+    data = x2,
+    x = TRUE,
+    y = TRUE,
+    model = FALSE,
+    ties = "efron",
+    tt = rep(list(tt_fun), length(dummy_names))
+  )
+  
+  attr(fit, "Infestation_levels") <- levels(xx$Infestation)
+  attr(fit, "level_map") <- level_map
+  attr(fit, "dummy_names") <- dummy_names
+  
+  fit
+}
+
+## Pairwise comparison for models containg tt()
+pairwise_tt_contrasts <- function(fit, times = c(24, 48, 72),
+                                  adjust = "BH",
+                                  adjust_within_time = TRUE) {
+  
+  levs <- attr(fit, "Infestation_levels")
+  level_map <- attr(fit, "level_map")
+  dummy_names <- attr(fit, "dummy_names")
+  
+  beta <- stats::coef(fit)
+  V <- stats::vcov(fit)
+  
+  needed_coef <- c(dummy_names, paste0("tt(", dummy_names, ")"))
+  needed_coef <- intersect(needed_coef, names(beta))
+  
+  beta <- beta[needed_coef]
+  V <- V[needed_coef, needed_coef, drop = FALSE]
+  
+  make_lp_vector <- function(level, time) {
+    
+    v <- rep(0, length(beta))
+    names(v) <- names(beta)
+    
+    # Reference level has all zero coefficients
+    if (level == levs[1]) {
+      return(v)
+    }
+    
+    d <- level_map$dummy[level_map$Infestation == level]
+    
+    main_name <- d
+    tt_name <- paste0("tt(", d, ")")
+    
+    if (main_name %in% names(v)) {
+      v[main_name] <- 1
+    }
+    
+    if (tt_name %in% names(v)) {
+      v[tt_name] <- log(pmax(time, 1))
+    }
+    
+    v
+  }
+  
+  out <- purrr::map_dfr(times, function(ttime) {
+    
+    pairs <- utils::combn(levs, 2, simplify = FALSE)
+    
+    purrr::map_dfr(pairs, function(pair) {
+      
+      level_1 <- pair[1]
+      level_2 <- pair[2]
+      
+      v1 <- make_lp_vector(level_1, ttime)
+      v2 <- make_lp_vector(level_2, ttime)
+      contrast_vec <- v1 - v2
+      
+      log_hr <- sum(contrast_vec * beta)
+      se <- sqrt(as.numeric(t(contrast_vec) %*% V %*% contrast_vec))
+      z <- log_hr / se
+      p <- 2 * stats::pnorm(-abs(z))
+      
+      tibble::tibble(
+        Hours_pi = ttime,
+        contrast = paste(level_1, "vs", level_2),
+        log_HR = log_hr,
+        SE = se,
+        z = z,
+        p.value = p,
+        HR = exp(log_hr),
+        lower.CL = exp(log_hr - 1.96 * se),
+        upper.CL = exp(log_hr + 1.96 * se)
+      )
+    })
+  })
+  
+  if (adjust_within_time) {
+    out <- out |>
+      dplyr::group_by(Hours_pi) |>
+      dplyr::mutate(
+        p.adj = stats::p.adjust(p.value, method = adjust)
+      ) |>
+      dplyr::ungroup()
+  } else {
+    out <- out |>
+      dplyr::mutate(
+        p.adj = stats::p.adjust(p.value, method = adjust)
+      )
+  }
+  
+  out %>%
+    mutate(., across(where(is.numeric), ~ round(.x, 4))) %>%
+    mutate(., across("p.value", ~ ifelse(.x < 0.0001, "<0.0001", .x))) %>%
+    mutate(., across("p.adj", ~ ifelse(.x < 0.0001, "<0.0001", .x)))
+  
+  out 
+}
+
+## Fixed proportional hazard assumption test 
+safe_cox_zph <- function(fit) {
+  tryCatch(survival::cox.zph(fit), # H0: Tests for no significant deviation from slope = 0
+           error = function(e) e)
+}
+## Fixed proportional hazard assumption test plot
+safe_ggcoxzph <- function(zph) {
+  if (inherits(zph, "error")) return("Error occurred")
+  tryCatch(survminer::ggcoxzph(zph), error = function(e) "Error occurred")
+}
+
+## Compares different version of the Cox proportional hazard model
+compare_cox_models <- function(models) {
+  purrr::imap_dfr(models, function(fit, nm) {
+    
+    aic_val <- tryCatch(AIC(fit), error = function(e) NA_real_)
+    edf_val <- tryCatch(extractAIC(fit)[1], error = function(e) NA_real_)
+    
+    y <- fit$y
+    event_col <- ncol(y)
+    
+    tibble::tibble(
+      model = nm,
+      n_rows = nrow(y),
+      events = sum(y[, event_col]),
+      loglik = tail(fit$loglik, 1),
+      edf = edf_val,
+      AIC = aic_val,
+      concordance = summary(fit)$concordance[1],
+      concordance_se = summary(fit)$concordance[2]
+    )
+  })
+}
+
+# Makes decision on whether to a time interaction for the Cox PH model
+DecisionMaking <- function(Table, AIC) {
+  
+  print(Table)
+  print(AIC)
+  
+  # prompts selection of number corresponding to transformation
+    aa <- readline("Choose how to continue:
+                   1 = Mod_cluster
+                   2 = Mod_frailty
+                   3 = Mod_frailty_tt")
+    
+    # Insures permissive input is given
+    if (as.numeric(aa) == 1) {
+      
+      aa <- 1
+      
+    } else if (as.numeric(aa) == 2) {
+      
+      aa <- 2
+      
+    } else if (as.numeric(aa) == 3) {
+      
+      aa <- 3
+      } else {
+      
+      print("Wrong input")
+      stop()
+    }
+    
+    aa
+}
+```
+
+```{r adjustable-variable-information, include = FALSE}
+#
+## Raw data folder
+RawDat <- "Data"
+
+RawDatSub <- "Survival"
+```
+
+```{r time-to-event-data-loading, include = FALSE}
+# LOADING DATA #################################################################
+
+## Get data directory
+survival_dir <- file.path(here::here(), RawDat, RawDatSub)
+## List all excel files in directory as full directory names
+survival_files <- list.files(survival_dir, pattern = "\\.xlsx$", full.names = TRUE)
+
+## Stop the script if no files are found
+stopifnot(length(survival_files) >= 1)
+
+## Load all data from all files contained within the directory
+DatSur_list <- purrr::map(survival_files, read_all)
+## Adjust the structure of data list
+DatSur <- if (length(DatSur_list) == 1L) {
+  DatSur_list[[1L]]
+} else {
+  purrr::imap(DatSur_list, function(x, file) {
+    prefix <- tools::file_path_sans_ext(basename(file))
+    stats::setNames(x, paste(prefix, names(x), sep = "__"))
+  }) |>
+    purrr::list_flatten()
+} 
+
+## Make adjustment to data table where new group means are required or two variables need to be merged as group names 
+DatSur <- DatSur %>%
+  lapply(., function(x) { # In cases where multiple variables need to be fused to a single group variable
+    
+    if (x %>% # In cases where multiple variables need to be fused to a single group variable
+        dplyr::select(any_of(c("Infestation", "Treatment"))) %>% # Check if both columns are present
+        ncol(.) >= 2) {
+      
+      x %>%
+        mutate(., "Infestation_Round" = .$Infestation) %>% # Retain original Infestation variable
+        mutate(., across(Infestation, ~paste0(x$Infestation, "_", x$Treatment))) %>% # Create new group names under "Infestation" by merging "Infestation" and "Treatment" variables
+        mutate(., across(where(is.character), as.factor)) # Convert all character columns into factors
+    } else {
+      x
+    }
+  }) %>% 
+  # Rearrange factor levels so we compare to the desired control group
+  imap(~if (str_detect(.y, "E_collar")) {
+    .x %>% mutate(Infestation = factor(Infestation, levels = c("Unrestricted", "Restricted")))
+  } else {
+    .x
+  }) %>%
+  imap(~if (str_detect(.y, "FTY720")) {
+    .x %>% mutate(Infestation = factor(Infestation, levels = c("1st_PBS", "1st_FTY720", "2nd_PBS", "2nd_FTY720")))
+  } else {
+    .x
+  })
+
+## Adjust variables to factors, where needed
+DatSur <- lapply(DatSur, function(xx) {
+  xx %>%
+    mutate(., across(any_of(c("Guinea_Pig", "Infestation", "Repeat", "Treatment")), as.factor))
+})
+
+# Tidy up what you do not need anymore
+rm(survival_dir, survival_files, DatSur_list)
+```
+
+```{r peto-peto-analysis, include = FALSE, cache = TRUE, cache.extra = file.mtime('Survival_Data.xlsx'), dev = 'png', fig.show = 'hide'}
+# STANDARD ANALYSIS USING THE PETO-PETO MODIFICATION----------------------------
+## Run analysis on data
+ResSur <- purrr::map(DatSur, fit_peto, group_var = "Infestation")
+```
+
+```{r cox-proportional-hazard-model, include = FALSE, cache = TRUE, cache.extra = file.mtime('Survival_Data.xlsx'), dev = 'png', fig.show = 'hide'}
+# Cox proportional hazard model ---------------------------------------------
+## This assess two things, whether guinea pigs represent a level two unit as multiple ticks are placed per guinea pig, and that guinea pigs were repeatedly used in consecutive infestations
+ResCox <- DatSur %>%
+  lapply(., function(x) {
+
+  # This is the section on Cox PH model variation testing to identify the best model for the data
+    #As the study design places multiple ticks per guinea pig, there may be potential clustering that needs to be considered. This can be address by including a clustering or frailty term in the equation. It is also possible that the proportional hazards assumption is not met. In this case we need to include a tt() term that allows for the proportional hazard to change over time.  
+    
+    ## Cluster-robust inference for repeated ticks within guinea pig
+    CoxPH_cluster <- survival::coxph(Surv(Hours_pi, Event) ~ Infestation,
+                                     data = x,
+                                     x = TRUE,
+                                     y = TRUE,
+                                     ties = "efron",
+                                     cluster = x$Guinea_Pig
+                                     )
+    
+    ## Frailty model as random-effect sensitivity / heterogeneity check
+    CoxPH_frailty <- survival::coxph(Surv(Hours_pi, Event) ~ Infestation +
+                                       frailty(Guinea_Pig, distribution = "gaussian"),
+                                     data = x,
+                                     x = TRUE,
+                                     y = TRUE,
+                                     ties = "efron"
+                                     )
+    
+    ## No fixed proportional hazard + frailty model
+    CoxPH_tt <- fit_cox_tt(x)
+    
+      ### Combine the output of all models
+      model_list <- list("Mod_cluster" = CoxPH_cluster,
+                         "Mod_frailty" = CoxPH_frailty,
+                         "Mod_frailty_timevarying" = CoxPH_tt
+                         )
+  
+      ### Check all models for compliance with proportional hazard assumption (p >= 0.05 means true)
+      CoxPHAss <- model_list %>%
+        lapply(., function(xx) {
+          safe_cox_zph(xx)
+          })
+      
+      ### Compare all the Cox proportional hazard models
+      CoxPHmodComp <- compare_cox_models(model_list) %>%
+        as.data.frame(.) %>%
+        mutate(., "Smallest_AIC" = c(.$AIC == min(.$AIC)))
+      
+  #-----------------------------------------------------------------------------
+          
+  # Make a decision based on assumption check, whether to apply time interaction, or not
+  aa <- DecisionMaking(Table = CoxPHAss,
+                       AIC = CoxPHmodComp)
+    
+  #-----------------------------------------------------------------------------
+   
+  # Here we acquire further information on our data with the chosen model    
+    ## Pairwise comparison of all factor levels
+    if (aa == 3) {
+      pairCompCoxPH <- pairwise_tt_contrasts(model_list[[aa]])
+      
+      HazRat <- "AHR integrated in pairCompCoxPH"
+    } else {
+      pairCompCoxPH <- emmeans::lsmeans(model_list[[aa]], pairwise ~ Infestation, adjust = "BH")
+      
+      ## Hazard Ratio (HR) for Cox proportional hazard model without random factor
+      HazRat <- cbind("HR" = summary(model_list[[aa]])$coef %>%
+                        as.data.frame(.) %>%
+                        dplyr::filter(grepl("Infestation", rownames(.))) %>%
+                        .[, "coef"] %>%
+                        exp(.),
+                      
+                      exp(confint(model_list[[aa]])),
+                      
+                      "p-value" = summary(model_list[[aa]])$coef %>%
+                        as.data.frame(.) %>%
+                        dplyr::filter(grepl("Infestation", rownames(.))) %>% 
+                        dplyr::select(any_of(c("Pr(>|z|)", "p"))) %>%
+                        set_colnames("p-value")
+                      ) %>%
+        as.data.frame(.) %>%
+          mutate("sig." = symnum(
+            .$`p-value`,
+            cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 0.1, 1),
+            symbols = c("****", "***", "**", "*", "+", " "),
+            abbr.colnames = FALSE,
+            na = ""
+          )) %>%
+        mutate(., across(where(is.numeric), ~ round(.x, 4))) %>%
+        mutate(., across("p-value", ~ ifelse(.x < 0.0001, "<0.0001", .x))) %>%
+        tibble:: rownames_to_column(., var = "Factor")
+    }
+      
+  #-----------------------------------------------------------------------------
+
+    # If proportional hazard assumption is violated and tt() is included
+    if (aa == 3) {
+      
+      # Step wise AHR according to time points----------------------------------
+      HRbyT <- map_dfr(attr(CoxPH_tt, "dummy_names"), function(dummy) {
+        
+        # Extract the mapping table that links dummy columns to original factor levels
+        level_map   <- attr(CoxPH_tt, "level_map")
+        
+        # Gather all unique observed time points from your raw data vector to loop through
+        time_points <- sort(c(0, unique(x$Hours_pi))) 
+        
+        # Pull the complete vector of beta coefficients from the model
+        model_coef <- coef(CoxPH_tt)
+        
+        # Pull the full variance-covariance matrix from the model
+        # This contains the variances on the diagonal and covariances on the off-diagonals
+        model_vcov <- vcov(CoxPH_tt)
+      
+        # Construct the exact string name survival uses for the interaction term
+        # Example: "tt(Infestation2nd)"
+        tt_name <- paste0("tt(", dummy, ")")
+        
+        # Look up the clean, original factor level string for final reporting
+        # Example: Maps "Infestation2nd" down to just "2nd"
+        factor_level <- level_map %>% 
+          dplyr::filter(dummy == !!dummy) %>% 
+          pull(Infestation)
+        
+        # Extract the specific beta coefficient values from the model vector
+        beta_main <- model_coef[dummy]    # Main effect beta
+        beta_tt   <- model_coef[tt_name]  # Time-interaction beta
+        
+        # Extract specific variance and covariance values from the matrix
+        # These are needed to calculate mathematically sound standard errors over time
+        var_main    <- model_vcov[dummy, dummy]     # Variance of main effect
+        var_tt      <- model_vcov[tt_name, tt_name] # Variance of interaction effect
+        cov_main_tt <- model_vcov[dummy, tt_name]   # Covariance between main and interaction
+        
+        
+        # 3. INNER LOOP: CALCULATE HAZARD RATIOS FOR EACH TIME POINT
+        map_dfr(time_points, function(t) {
+          
+          # CRITICAL: Scale the time point 't' using your model's exact tt_fun logic
+          # Your model used log(pmax(t, 1)), so your multiplier must match exactly
+          t_scaled <- log(pmax(t, 1))
+          
+          # Calculate the combined log-hazard ratio at this specific scaled time point
+          log_hr <- beta_main + (beta_tt * t_scaled)
+          
+          # Delta Method Variance Formula: Var(A + bB) = Var(A) + b^2*Var(B) + 2*b*Cov(A,B)
+          # We take the square root of the final variance to get the Standard Error (SE)
+          se_log_hr <- sqrt(var_main + ((t_scaled^2) * var_tt) + (2 * t_scaled * cov_main_tt))
+          
+          # Convert log scale metrics back to traditional Hazard Ratios (Exponentiation)
+          ahr    <- exp(log_hr)                         # Adjusted Hazard Ratio point estimate
+          low_ci <- exp(log_hr - (1.96 * se_log_hr))    # Lower 95% Confidence Interval limit
+          upp_ci <- exp(log_hr + (1.96 * se_log_hr))    # Upper 95% Confidence Interval limit
+          
+          # Package values into a structured, tidy format for the current row
+          tibble(
+            Infestation_Level = factor_level,
+            Time_Point        = paste0(t, "h_pi"),
+            Hours             = t,
+            Adjusted_HR       = ahr,
+            Lower_95_CI       = low_ci,
+            Upper_95_CI       = upp_ci,
+            HR_String         = sprintf("%.2f (%.2f - %.2f)", ahr, low_ci, upp_ci)
+          )
+        })
+      })
+
+      # When AHR becomes 1------------------------------------------------------
+      AHRis <- map_dfr(attr(CoxPH_tt, "dummy_names"), function(dummy) {
+  
+        # Extract the mapping table that links dummy columns to original factor levels
+        level_map   <- attr(CoxPH_tt, "level_map")
+        
+        # Pull the complete vector of beta coefficients from the model
+        model_coef <- coef(CoxPH_tt)
+        
+        # Construct the interaction term name
+        tt_name <- paste0("tt(", dummy, ")")
+        
+        # Fetch clean factor label mapping
+        factor_level <- level_map %>% 
+          dplyr::filter(dummy == !!dummy) %>% 
+          pull(Infestation)
+        
+        # Extract specific coefficients for this level
+        beta_main <- model_coef[dummy]
+        beta_tt   <- model_coef[tt_name]
+        
+        # Math Breakdown:
+        # Setting log_hr = 0 -> beta_main + (beta_tt * log(t)) = 0
+        # Solving for log(t) -> log(t) = -beta_main / beta_tt
+        # Solving for original hours t -> t = exp(-beta_main / beta_tt)
+        scaled_inflection_time <- -1 * beta_main / beta_tt
+        actual_hours_pi        <- exp(scaled_inflection_time)
+        
+        # Return structured findings
+        tibble(
+          Infestation_Level      = factor_level,
+          Main_Effect_Beta       = beta_main,
+          Interaction_Beta       = beta_tt,
+          Log_Scaled_Time        = scaled_inflection_time,
+          Hours_At_HR_1          = actual_hours_pi
+        )
+      })
+        
+      # Step wise AHR according to time points for the plot
+      AHR <- map_dfr(attr(CoxPH_tt, "dummy_names"), function(dummy) {
+        
+        # Extract the mapping table that links dummy columns to original factor levels
+        level_map   <- attr(CoxPH_tt, "level_map")
+        
+        # Gather all unique observed time points from your raw data vector to loop through
+        time_points <- seq(min(x$Hours_pi[x$Event == 1]),
+                           max(x$Hours_pi[x$Event == 1]),
+                           1) 
+        
+        # Pull the complete vector of beta coefficients from the model
+        model_coef <- coef(CoxPH_tt)
+        
+        # Pull the full variance-covariance matrix from the model
+        # This contains the variances on the diagonal and covariances on the off-diagonals
+        model_vcov <- vcov(CoxPH_tt)
+      
+        # Construct the exact string name survival uses for the interaction term
+        # Example: "tt(Infestation2nd)"
+        tt_name <- paste0("tt(", dummy, ")")
+        
+        # Look up the clean, original factor level string for final reporting
+        # Example: Maps "Infestation2nd" down to just "2nd"
+        factor_level <- level_map %>% 
+          dplyr::filter(dummy == !!dummy) %>% 
+          pull(Infestation)
+        
+        # Extract the specific beta coefficient values from the model vector
+        beta_main <- model_coef[dummy]    # Main effect beta
+        beta_tt   <- model_coef[tt_name]  # Time-interaction beta
+        
+        # Extract specific variance and covariance values from the matrix
+        # These are needed to calculate mathematically sound standard errors over time
+        var_main    <- model_vcov[dummy, dummy]     # Variance of main effect
+        var_tt      <- model_vcov[tt_name, tt_name] # Variance of interaction effect
+        cov_main_tt <- model_vcov[dummy, tt_name]   # Covariance between main and interaction
+        
+          
+          # 3. INNER LOOP: CALCULATE HAZARD RATIOS FOR EACH TIME POINT
+          map_dfr(time_points, function(t) {
+            
+            # CRITICAL: Scale the time point 't' using your model's exact tt_fun logic
+            # Your model used log(pmax(t, 1)), so your multiplier must match exactly
+            t_scaled <- log(pmax(t, 1))
+            
+            # Calculate the combined log-hazard ratio at this specific scaled time point
+            log_hr <- beta_main + (beta_tt * t_scaled)
+            
+            # Delta Method Variance Formula: Var(A + bB) = Var(A) + b^2*Var(B) + 2*b*Cov(A,B)
+            # We take the square root of the final variance to get the Standard Error (SE)
+            se_log_hr <- sqrt(var_main + ((t_scaled^2) * var_tt) + (2 * t_scaled * cov_main_tt))
+            
+            # Convert log scale metrics back to traditional Hazard Ratios (Exponentiation)
+            ahr    <- exp(log_hr)                         # Adjusted Hazard Ratio point estimate
+            low_ci <- exp(log_hr - (1.96 * se_log_hr))    # Lower 95% Confidence Interval limit
+            upp_ci <- exp(log_hr + (1.96 * se_log_hr))    # Upper 95% Confidence Interval limit
+            
+            # Package values into a structured, tidy format for the current row
+            tibble(
+              Infestation_Level = factor_level,
+              Time_Point        = paste0(t, "h_pi"),
+              Hours             = t,
+              Adjusted_HR       = ahr,
+              Lower_95_CI       = low_ci,
+              Upper_95_CI       = upp_ci,
+              HR_String         = sprintf("%.2f (%.2f - %.2f)", ahr, low_ci, upp_ci)
+            )
+          })
+        })
+        
+        # Uses a medium gray background to balance contrast for both bright and dark lines------------------------------
+        AHRplot <-ggplot(AHR, aes(x = Hours, y = Adjusted_HR, color = Infestation_Level)) +
+          geom_line(linewidth = 1.5, linetype = "solid") +
+          scale_colour_viridis_d(option = "viridis") + 
+          scale_x_continuous(limits = c(0, ceiling(max(AHR$Hours, na.rm = TRUE) / 10) * 10)) +
+          scale_y_continuous(limits = c(0, ceiling(max(AHR$Adjusted_HR, na.rm = TRUE) / 10) * 10)) +
+          geom_hline(yintercept = 1, color = "black", linetype = "dashed", linewidth = 1) +
+          geom_vline(data = AHRis, aes(xintercept = Hours_At_HR_1, color = Infestation_Level), 
+                     linetype = "dotted", linewidth = 1, show.legend = FALSE) +
+          theme_grey() + # Restores standard grey baseline
+          theme(
+            panel.background = element_rect(fill = "#8a8a8a"),  # True medium gray panel
+            plot.background = element_rect(fill = "#e0e0e0"),   # Light gray outer canvas
+            panel.grid.major = element_line(color = "#b0b0b0"), # Light grid lines for visibility
+            panel.grid.minor = element_line(color = "#9e9e9e"),
+            text = element_text(color = "black"),               # Dark text for medium gray reading
+            axis.text = element_text(color = "black"),
+            legend.background = element_rect(fill = "#e0e0e0"),
+            legend.key = element_rect(fill = "#8a8a8a")         # Keys match the plot canvas
+          )
+              
+          } else {
+            
+            HRbyT <- "No time dependent PH"
+            AHRis <- "No time dependent PH"
+            AHRplot <- "No time dependent PH"
+          }    
+             
+  #-----------------------------------------------------------------------------
+    
+    # Outlier analysis
+    # Visual inspection by graphing
+    OutMart <- resid(model_list[[aa]], type = "martingale") %>% 
+      as.data.frame() %>% 
+      tibble::rownames_to_column(., var = "Index") %>% 
+      rename("Residuals" = ".") %>%
+      mutate(., across(where(is.character), as.numeric))
+    
+    OutMartPlot <- ggplot(OutMart, aes(x = Index, y = Residuals)) + 
+      geom_point(shape=1, fill="white", color="black", size=3) +
+      scale_x_continuous(limits = c(0,nrow(OutMart)), n.breaks = 7) +
+      labs(x = "Observation", y = "Martingale residual") +
+      theme_bw()
+    
+    OutDev <- resid(model_list[[aa]], type = "deviance") %>% 
+      as.data.frame() %>% 
+      tibble::rownames_to_column(., var = "Index") %>% 
+      rename("Residuals" = ".") %>%
+      mutate(., across(where(is.character), as.numeric))
+    
+    OutDevPlot <- ggplot(OutDev, aes(x = Index, y = Residuals)) + 
+      geom_point(shape=1, fill = "white", color = "black", size = 2) +
+      scale_x_continuous(limits = c(0,nrow(OutMart)), n.breaks = 7) +
+      labs(x = "Observation", y = "Deviance residual") +
+      theme_bw()
+    
+    OutlierPlot <- ggarrange(OutMartPlot, OutDevPlot,
+                             labels = c("A", "B"),
+                             ncol = 2, nrow = 1)
+    
+    # Get a list of sorted Martingale and Deviance residuals to identify the outliers
+    OutLieM <- sort(resid(model_list[[aa]], type = "martingale"))
+    OutLieD <- sort(resid(model_list[[aa]], type = "deviance"))
+    
+    # x[c(as.numeric(names(OutLieM))),] # Use this to see where the outliers came from
+    
+    
+  # Influential observations' test
+    # Check if tt() was applied to model
+    DFBETAS <- names(
+      as.data.frame(
+        model.matrix(model_list[[aa]]))) %>%
+      { if ("tt(InfNum)" %in% .) {
+        
+        # Get the dfbetas from the model
+        resid(model_list[[aa]], type = "dfbetas") %>% 
+          as.data.frame(.) %>% 
+          .[order(as.numeric(rownames(.))),] %>% 
+          as.data.frame(.) %>%
+          .[, 1:ncol(.)-1] %>%
+          as.data.frame(.)
+        
+      } else {
+        
+        # Get the dfbetas from the model
+        resid(model_list[[aa]], type = "dfbetas") %>% 
+          as.data.frame(.) %>% 
+          .[order(as.numeric(rownames(.))),] %>% 
+          as.data.frame(.)
+      } }
+    
+    # Get the predictor factor levels minus the reference they are compared to
+    InfLev <- names(
+      as.data.frame(
+        model.matrix(model_list[[aa]])))[grepl("Infestation", names(as.data.frame(model.matrix(model_list[[aa]]))))] %>%
+        gsub("(Infestation)", "\\1: ", .)
+    
+    # Build influential observation plots
+      # Generate plots
+      DFBETAS2 <- DFBETAS %>% 
+        set_colnames(InfLev) %>%
+        tibble::rownames_to_column(., var = "Index") %>% 
+        mutate(., across(where(is.character), as.numeric))
+    
+      # Renders all the plots  
+      InfObs <- lapply(InfLev, function(aa) {
+        ggplot(DFBETAS2, aes(x = Index, y = !!sym(aa))) + 
+          geom_point(shape = 1, 
+                     fill  = "white", 
+                     color = "black", 
+                     size  = 2) +
+          geom_hline(yintercept = c(0.2, -0.2),
+                     color = "red",
+                     linetype = "dashed",
+                     linewidth = 1) +
+          scale_x_continuous(limits   = c(0, nrow(DFBETAS2)), 
+                             n.breaks = ceiling(nrow(DFBETAS2) / 100)) +
+          theme_bw()
+      })
+      
+      # Renders all the plots  
+      InfObsPlot <- ggarrange(plotlist = InfObs[c(1:ncol(DFBETAS))],
+                              labels = letters[seq( from = 1, to = ncol(DFBETAS))],
+                              ncol = ifelse(ncol(DFBETAS) == 1, 1, 2), 
+                              nrow = ceiling(length(InfObs)/2))
+      
+      # Identifies influential observations (defined as either dfbeta > 0.2 or < -0.2) within the data table (DatSurInt)
+      SUB <- list("Obs_>0.2" = DFBETAS[order(as.numeric(rownames(DFBETAS))),] > 0.2,
+                  "Obs_<-0.2" = DFBETAS[order(as.numeric(rownames(DFBETAS))),] < -0.2)
+
+  #-----------------------------------------------------------------------------
+          
+  # Collate test assumption check check and test output table
+  Res.CoxPH <- list("Cox PH model chosen"                 = names(model_list[aa]),
+                    "Cox PH model output"                 = model_list[[aa]],
+                    "Cox model compaison (AIC)"           = CoxPHmodComp,
+                    "Assumption test"                     = CoxPHAss, 
+                    "Pairwise comparison"                 = pairCompCoxPH,
+                    "Adjusted Hazard Ratio"               = HazRat,
+                    # Information only for tt() inclusion
+                    "Stepwise AHR"                        = HRbyT,
+                    "Time when AHR = 1"                   = AHRis,
+                    "Stepwise AHR plot"                   = AHRplot,
+                    # Model behavior assessment
+                    "Outliers Plot"                       = OutlierPlot,
+                    "Outliers (Martingale Residuals)"     = OutLieM,
+                    "Outliers (Deviance Residuals)"       = OutLieD,
+                    "Influential Observations Plot"       = InfObsPlot,
+                    "Influential Observations"            = SUB)
+})
+```
+
+```{r comparing-different-tick-species-removal-profiles, include = FALSE, eval = TRUE}
+# This is for the comparison of tick removal profiles of different tick species on guinea pigs
+# This section collats data sets together for further analysis below
+## Get the Rep_Exp data sets only
+DatSurRep <- DatSur[grep("Rep_Exp", names(DatSur))]
+
+## Pair data sets by name with the I_scapularis one
+Pairs <- lapply(names(DatSurRep[-grep("I_scapularis", names(DatSurRep))]), function(xx) {
+  
+  list(names(DatSurRep[grep("I_scapularis", names(DatSurRep))]), xx) %>%
+    unlist(.)
+}) %>%
+  purrr::set_names(names(DatSurRep[-grep("I_scapularis", names(DatSurRep))]))
+
+## Combines the two data sets into a single dataframe
+DatSurComp <- lapply(Pairs, function(qq) {
+  
+  bind_rows(
+    list(DatSurRep[[qq[1]]],
+         DatSurRep[[qq[2]]]) %>%
+      purrr::set_names(qq %>%
+                         sub(".*Rep_Exp_", "", .)),
+    .id = "Data_Source") %>%
+    mutate(., "Groups" = paste(.[["Data_Source"]], .[["Infestation"]], sep = "_")) %>%
+    droplevels(.) %>%
+    mutate(., across(where(is.character), as.factor)) %>%
+    mutate(Groups = fct_relevel(Groups, c("I_scapularis_1st", "I_scapularis_2nd", "I_scapularis_3rd")))
+})
+
+# Tidy up what you do not need anymore
+rm(DatSurRep, Pairs)
+```
+
+```{r peto-peto-analysis-for-pairs, include = FALSE, cache = TRUE, cache.extra = file.mtime('Survival_Data.xlsx'), dev = 'png', fig.show = 'hide'}
+# STANDARD ANALYSIS USING THE PETO-PETO MODIFICATION----------------------------
+# This compares the data sets of different tick species to I. scapularis
+## Run analysis on data
+ResSurComp <- purrr::map(DatSurComp, fit_peto, group_var = "Groups")
+```
+
+
+```{r cox-proportional-hazard-model-for-pairs, include = FALSE, cache = TRUE, cache.extra = file.mtime('Survival_Data.xlsx'), dev = 'png', fig.show = 'hide'}
+
+# Cox proportional hazard model for comparison to I. scapularis-----------------
+# This assess two things, whether guinea pigs represent a level two unit as multiple ticks are placed per guinea pig, and that guinea pigs were repeatedly used in consecutive infestations
+ResCoxComp <- lapply(DatSurComp, function(xx) {
+  
+  ## Cluster-robust inference for repeated ticks within guinea pig
+  CoxPH_cluster <- survival::coxph(Surv(Hours_pi, Event) ~ Groups,
+                                   data = xx,
+                                   x = TRUE,
+                                   y = TRUE,
+                                   ties = "efron",
+                                   cluster = xx$Guinea_Pig
+                                   )
+  
+    ### Check all models for compliance with proportional hazard assumption (p >= 0.05 means true)
+    CoxPHAss <- safe_cox_zph(CoxPH_cluster)
+      
+  ## Here we acquire further information on our data with the chosen model    
+    ## Pairwise comparison of all factor levels
+    pairCompCoxPH <- emmeans::lsmeans(CoxPH_cluster, pairwise ~ Groups, adjust = "BH") %>%
+      .[["contrasts"]] %>% 
+      as.data.frame() %>%
+      dplyr::filter(str_detect(.[, "contrast"], "(1st|2nd|3rd).*\\1")) %>%
+      mutate("sig." = ifelse(.$p.value < 0.0001, "****",
+                           ifelse(.$p.value < 0.001, "***",
+                                  ifelse(.$p.value < 0.01, "**",
+                                         ifelse(.$p.value <= 0.05, "*",
+                                                ifelse(.$p.value < 0.1, "+", "")))))) %>%
+      mutate(., across(where(is.numeric), ~ round(.x, 4))) %>%
+      mutate(., across("p.value", ~ ifelse(.x < 0.0001, "<0.0001", .x)))
+      
+  #-----------------------------------------------------------------------------
+          
+  # Collate test assumption check check and test output table
+  Res.CoxPH <- list("Cox PH model output"                 = CoxPH_cluster,
+                    "Assumption test"                     = CoxPHAss, 
+                    "Pairwise comparison"                 = pairCompCoxPH
+                    )
+})
+```
+
+```{r save-essential-output, include = FALSE}
+# Save the pairwise Cox PH model and AHR data for all scratch bouts to the head
+
+  ## Create workbook to store data
+  wb <- openxlsx::createWorkbook() 
+  
+  ## Vector of sheet names
+  SheetNames <- paste(rep(names(ResCox), each = 2), c("PC", "AHR"), sep = "_") 
+  
+  ## Collat the data we want to export
+  DatOut <- lapply(ResCox, function(xx) {
+    
+    if (length(xx[["Pairwise comparison"]]) != 2) {
+      
+      list(contrasts = xx[["Pairwise comparison"]],
+           AHR = xx[["Adjusted Hazard Ratio"]])
+      
+    } else {
+      
+      list(contrasts = xx[["Pairwise comparison"]][["contrasts"]],
+           AHR = xx[["Adjusted Hazard Ratio"]])
+    }
+  }) %>%
+    unlist(., recursive = FALSE) %>%
+    purrr::set_names(SheetNames)
+
+  ## Implementation of sheets into workbook
+  sapply(SheetNames, function(x) { addWorksheet(wb, sheetName = x) }, simplify = FALSE) 
+  
+  ## writing the data into the respective workbook sheet
+  mapply(function(x, y) { 
+    
+    writeData(wb, 
+              sheet = y, 
+              x = x, 
+              startRow = 1, 
+              startCol = 1, 
+              rowNames = TRUE) 
+    
+    }, x = DatOut,
+       y = SheetNames)
+
+  
+  
+  ## Saving the workbook
+  openxlsx::saveWorkbook(wb, 
+                         file = paste(here::here(),
+                                      "Output",
+                                      "Survival",
+                                      "Survival data.xlsx", 
+                                      sep = "/"),
+                         overwrite = TRUE)
+  
+#-------------------------------------------------------------------------------
+  
+  # Save the data for all scratch bouts to the head
+
+  ## Create workbook to store data
+  wb <- openxlsx::createWorkbook() 
+  
+  ## Vector of sheet names
+  SheetNames <- names(ResCoxComp) %>%
+    sub(".*Rep_Exp_", "", .)
+  
+  ## Collate the data we want to export
+  DatOut <- lapply(ResCoxComp, function(xx) {
+    
+    contrasts = xx[["Pairwise comparison"]]
+    
+  }) %>%
+    purrr::set_names(SheetNames)
+
+  ## Implementation of sheets into workbook
+  sapply(SheetNames, function(x) { addWorksheet(wb, sheetName = x) }, simplify = FALSE) 
+  
+  ## writing the data into the respective workbook sheet
+  mapply(function(x, y) { 
+    
+    writeData(wb, 
+              sheet = y, 
+              x = x, 
+              startRow = 1, 
+              startCol = 1, 
+              rowNames = TRUE) 
+    
+    }, x = DatOut,
+       y = SheetNames)
+
+  
+  
+  ## Saving the workbook
+  openxlsx::saveWorkbook(wb, 
+                         file = paste(here::here(),
+                                      "Output",
+                                      "Survival",
+                                      "Survival comparison data.xlsx", 
+                                      sep = "/"),
+                         overwrite = TRUE) 
+  
+#-------------------------------------------------------------------------------
+
+# Tidy up  
+rm(wb, SheetNames, DatOut)
+  
+gc()
+```
+
+```{r create-output-table, include = FALSE}
+# Produce tables of the pairwise Cox PH models
+mapply(function(aa, bb) {
+  mapply(function(yy, zz) {
+    # Get the pairwise comparison for each survival plot
+    if (length(yy[["Pairwise comparison"]]) != 2) {
+        
+        Pairwise <- yy[["Pairwise comparison"]] %>%
+          mutate("sig." = symnum(
+            .$p.adj,
+            cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 0.1, 1),
+            symbols = c("****", "***", "**", "*", "+", " "),
+            abbr.colnames = FALSE,
+            na = ""
+          )) %>%
+          mutate(., across(where(is.numeric), ~ round(.x, 4))) %>%
+          mutate(., across(c("p.value", "p.adj"), ~ ifelse(.x < 0.0001, "<0.0001", .x)))
+        
+      } else {
+        
+        Pairwise <- yy[["Pairwise comparison"]][["contrasts"]] %>%
+          as.data.frame() %>%
+          mutate("sig." = symnum(
+            .$p.value,
+            cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 0.1, 1),
+            symbols = c("****", "***", "**", "*", "+", " "),
+            abbr.colnames = FALSE,
+            na = ""
+          )) %>%
+          mutate(., across(where(is.numeric), ~ round(.x, 4))) %>%
+          mutate(., across("p.value", ~ ifelse(.x < 0.0001, "<0.0001", .x)))
+      }
+    
+    # Turn it into a table
+    gtsave(data =
+           Pairwise %>%
+             as.data.frame() %>%
+             # Build a table
+             gt() %>%
+             tab_header(
+               title = md("**Pairwise Comparison**"),
+               subtitle = zz
+               ) %>%
+             tab_style(
+               style = cell_text(align = "center"),
+               locations = cells_column_labels()),
+           filename = paste0(zz, "_PW", ".png"),
+           path = paste(here(), "Output", "Tables", "Survival", bb, sep = "/"))
+    
+    
+  }, yy = aa,
+     zz = names(aa) %>%
+                  sub(paste0(".*", bb), "", .))
+}, aa = lapply(c("Rep_Exp", "E_collar", "FTY720"), function(zz) {
+          ResCox[grepl(zz,  names(ResCox))]
+        }) %>%
+  purrr::set_names(c("Rep_Exp", "E_collar", "FTY720")),
+   bb = c("Rep_Exp_", "E_collar_", "FTY720_"))
+
+#-------------------------------------------------------------------------------
+
+# Produce tables of the adjusted hazard ratios
+mapply(function(aa, bb) {
+  mapply(function(yy, zz) {
+    # Get the pairwise comparison for each survival plot
+    if (length(yy[["Adjusted Hazard Ratio"]]) == 1) {
+        
+        AHR <- yy[["Pairwise comparison"]] %>%
+          mutate("sig." = symnum(
+            .$p.adj,
+            cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 0.1, 1),
+            symbols = c("****", "***", "**", "*", "+", " "),
+            abbr.colnames = FALSE,
+            na = ""
+          )) %>%
+          mutate(., across(where(is.numeric), ~ round(.x, 4))) %>%
+          mutate(., across(c("p.value", "p.adj"), ~ ifelse(.x < 0.0001, "<0.0001", .x)))
+        
+      } else {
+        
+        AHR <- yy[["Adjusted Hazard Ratio"]]
+      }
+    
+    # Turn it into a table
+    gtsave(data =
+           AHR %>%
+             as.data.frame() %>%
+             # Build a table
+             gt() %>%
+             tab_header(
+               title = md("**Adjusted Hazards Ratios**"),
+               subtitle = zz
+               ) %>%
+             tab_style(
+               style = cell_text(align = "center"),
+               locations = cells_column_labels()),
+           filename = paste0(zz, "_AHR", ".png"),
+           path = paste(here(), "Output", "Tables", "Survival", bb, sep = "/"))
+    
+    
+  }, yy = aa,
+     zz = names(aa) %>%
+                  sub(paste0(".*", bb), "", .))
+}, aa = lapply(c("Rep_Exp", "E_collar", "FTY720"), function(zz) {
+          ResCox[grepl(zz,  names(ResCox))]
+        }) %>%
+  purrr::set_names(c("Rep_Exp", "E_collar", "FTY720")),
+   bb = c("Rep_Exp_", "E_collar_", "FTY720_"))
+
+#-------------------------------------------------------------------------------
+
+# Produce tables of the pairwise Cox PH models of different tick species to I. scapularis
+mapply(function(yy, zz) {
+  # Get the pairwise comparison for each survival plot
+  Pairwise <- yy[["Pairwise comparison"]]
+  
+  # Turn it into a table
+  gtsave(data =
+         Pairwise %>%
+           as.data.frame() %>%
+           # Build a table
+           gt() %>%
+           tab_header(
+             title = md("**Pairwise Comparison**"),
+             subtitle = zz
+             ) %>%
+           tab_style(
+             style = cell_text(align = "center"),
+             locations = cells_column_labels()),
+         filename = paste0(zz, ".png"),
+         path = paste(here(), "Output", "Tables", "Survival", "Rep_Exp_Comparison", sep = "/"))
+  
+  
+}, yy = ResCoxComp,
+   zz = names(ResCoxComp) %>%
+                sub(".*Rep_Exp_", "", .))
+```
+
+```{r clearing-out-time-to-event-data, include = FALSE}
+# Delete variables that are no longer needed to free memory
+rm(RawDat, DatSur, DatSurComp, compare_cox_models, DecisionMaking, fit_cox_tt, fit_peto, pairwise_tt_contrasts, read_all, safe_cox_zph, safe_ggcoxzph)
+
+gc()
+```

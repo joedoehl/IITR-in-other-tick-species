@@ -1,0 +1,226 @@
+---
+title: "ELISA"
+author: "Johannes S. P. Doehl"
+date: "2024-08-19"
+output: pdf_document
+bibliography: Bibliography-BIB.bib
+---
+
+```{r elisa-load-data, include = FALSE, eval = TRUE}
+# LOADING DATA #################################################################
+# Get name(s) of excel files in the directory
+FilNam <- list.files(path = paste(here(), RawDat, "ELISA/", sep = "/"), pattern = "\\.xlsx$")
+
+# Read in data from excel file
+DatELISA <- read_all(paste(paste(here(), RawDat, "ELISA", sep = "/"), FilNam, sep = "/"))
+```
+
+```{r}
+lapply(DatELISA, function(qq){
+  
+  if (any(qq[["Sample"]] == "Standard_Curve")) {
+    
+    
+  }
+})
+```
+
+```{r elisa-data-normalization, include = FALSE, eval = TRUE}
+# Data normalization by averaging technical repeats and subtracting blank averages per plate
+DatNorm <- lapply(DatELISA, function(qq){
+  
+  if (any(qq[["Sample"]] == "Standard_Curve")) { # With standard curve available
+    
+    # Change factor level order for IgE
+    qq[["Sample"]] <- factor(qq[["Sample"]], 
+                             levels = c("Naïve", 
+                                        "Week1", 
+                                        "Week2", 
+                                        "Week3", 
+                                        "Week4", 
+                                        "Week10",
+                                        "Positive_Ctrl",
+                                        "Standard_Curve",
+                                        "Blank"))
+    
+    # Handle data normalization by plate
+    sapply(levels(qq[["Plate"]]), function(rr) {
+      
+      DatNorm <- qq[qq[["Plate"]] %like% rr,] %>%
+        # select technical replica columns and get the row means
+        mutate(., "Avg_OD" = .[, colnames(.) %like% "Duplicate"] %>%
+                 rowMeans(.)) %>%
+        # subtract the averaged negative water control "blank" from all other values from the same plate
+        mutate(., "delta_OD" = .[,"Avg_OD"] - .[.$Sample %in% "Blank",] %>%
+                          .[, colnames(.) %like% "Duplicate"] %>%
+                          unlist(.) %>%
+                          mean(.)) %>%
+        # remove the blanks form the table
+        .[!.$Sample %in% "Blank",]
+      
+      
+      # Extract the standard curve information
+      StdCrv <- DatNorm[DatNorm[["Sample"]] %in% "Standard_Curve",] %>%
+        # convert the factor format into numbers in two steps
+        mutate(., across("Guinea_pig", as.character)) %>%
+        mutate(., across("Guinea_pig", as.numeric)) 
+      
+      
+      # Interpolation of missing antibody concentrations against the standard curve
+      DatOut <- DatNorm[!DatNorm[["Sample"]] %in% "Standard_Curve",] %>%
+        mutate(., "Concentration" = approx(x = StdCrv[["delta_OD"]],
+                                           y = StdCrv[["Guinea_pig"]],
+                                           xout = .[["delta_OD"]])[["y"]])
+      
+    }, simplify = FALSE) %>%
+      bind_rows(.) %>%
+      droplevels(.)
+    
+  } else { # Without standard curve available
+    
+    # Change factor level order for IgG
+    qq[["Sample"]] <- factor(qq[["Sample"]], 
+                             levels = c("Naïve", 
+                                        "Week1", 
+                                        "Week2", 
+                                        "Week3", 
+                                        "Week4", 
+                                        "Week10", 
+                                        "Blank"))
+      
+    # Extract and normalize data
+    sapply(levels(qq[["Plate"]]), function(rr) {
+      
+      qq[qq[["Plate"]] %like% rr,] %>%
+        # select technical replica columns and get the row means
+        mutate(., "Avg_OD" = .[, colnames(.) %like% "Duplicate"] %>%
+                 rowMeans(.)) %>%
+        # subtract the averaged negative water control "blank" from all other values from the same plate
+        mutate(., "delta_OD" = .[,"Avg_OD"] - .[.$Sample %in% "Blank",] %>%
+                          .[, colnames(.) %like% "Duplicate"] %>%
+                          unlist(.) %>%
+                          mean(.)) %>%
+        # remove the blanks form the table
+        .[!.$Sample %in% "Blank",]
+      
+    }, simplify = FALSE) %>%
+      bind_rows(.)
+    
+  }
+})
+```
+
+```{r save-elisa-data, include = FALSE, eval = TRUE}
+# Save the data for all scratch bouts to the head
+# Directory to were data is saved
+BibPath1 <- paste(here(), 
+                  "Data", 
+                  "ELISA", 
+                  sep = "/")
+
+# Create subdirectory to save excel files
+dir.create(BibPath1, 
+           showWarnings = FALSE)  
+
+# Create workbook to store data
+wb <- openxlsx::createWorkbook() 
+
+# Vector of sheet names
+SheetNames <- names(DatNorm)
+
+# Implementation of sheets into workbook
+sapply(SheetNames, function(x) { addWorksheet(wb, sheetName = x) }, simplify = FALSE)
+
+  # writing the data into the respective workbook sheet  
+mapply(function(qq, rr) {  
+  
+  writeData(wb, 
+            sheet = rr, 
+            x = qq, 
+            startRow = 1, 
+            startCol = 1, 
+            rowNames = TRUE)
+}, qq = DatNorm, 
+   rr = SheetNames,
+   SIMPLIFY = FALSE)
+
+  # Saving the workbook
+  openxlsx::saveWorkbook(wb, 
+                         file = paste(BibPath1, 
+                                      "IgG and IgE titer.xlsx", 
+                                      sep = "/"), 
+                         overwrite = TRUE)
+
+gc()
+```
+
+```{r elisa-data-analysis, include = FALSE, eval = TRUE}
+# Data analysis
+ResELISA <- lapply(DatNorm, function(qq) {
+  
+  # Rename outcome variable to be consistent for model
+  if (any(colnames(qq) == "Concentration")) {
+    
+    Dat <- DatNorm$IgE %>%
+      rename("outcome" = "Concentration")
+    
+  } else {
+    
+    Dat <- qq %>%
+      rename("outcome" = "delta_OD")
+    
+  }
+  
+  # Summary Statistics of dependent variable: Event_Length
+  SumStat <- Dat %>%
+    select(Sample, outcome) %>%
+    group_by(Sample) %>%
+    get_summary_stats(., type = "full")
+  
+  # Run a linear regression model on the data as it showed lowest AIC
+  Mod <- lm(outcome ~ Sample,
+          data = Dat)
+  
+    SelMod <- "Linear Regression Model"
+  
+  # Get model summary
+  SumMod <- summary(Mod)
+    
+  # Get adjusted R2 for the model to assess fit
+  AdjR2 <- SumMod[["adj.r.squared"]]
+  
+  # Check of model predictor is relevant
+  AovMod <- anova(Mod)
+  
+  # Pairwise comparison
+  posthoc <- emmeans(Mod,
+                     pairwise ~ Sample,
+                     adjust = "sidak")
+    
+    # Lette code for pairwise comparison
+    PhLetter <- cld(posthoc,
+                    alpha = 0.05,
+                    Letters = letters,
+                    adjust = "sidak")
+    
+    ResPH <- "Estimated marginal means"
+  
+  # COLLATE DATA--------------------------------------------------------------
+   
+  # Collate the test outcome calls
+    AssTest <- as.data.frame(rbind("Selected model"      = SelMod,
+                                   "Pairwise comparison" = ResPH)) %>%
+      setNames(., "Outcome")
+      
+    # Compile output data list
+    AovDat <- list("Test selection"      = AssTest,
+                   "Data summary"        = SumStat,
+                   "Model"               = Mod,
+                   "Model summary"       = SumMod,
+                   "Adjused R2"          = AdjR2,
+                   "Model validity"      = AovMod,
+                   "Pairwise comparison" = posthoc,
+                   "Pairwise by letter"  = PhLetter)
+})
+```
+
